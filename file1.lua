@@ -416,6 +416,7 @@ local function main()
 	local Rapid = { on = false, rate = .05, acc = 0, aimFire = false }
 	local Hooks = { on = false, orig = nil }
 	local fovCircle = nil
+	local silentCircle = nil
 
 	local function wallbangRaycast(self, origin, direction, params)
 		if params == nil then return rawRaycast(self, origin, direction, params) end
@@ -477,13 +478,13 @@ local function main()
 		local vp = CAM.ViewportSize
 		local center = Vector2.new(vp.X * .5, vp.Y * .5)
 		local screenPos = Vector2.new(sp.X, sp.Y)
+		local activeCenter = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
 		if Aim.silent then
-			local silentCenter = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
-			local d = (screenPos - silentCenter).Magnitude
+			local d = (screenPos - activeCenter).Magnitude
 			if d > Aim.silentFov then return nil end
 			return d
 		else
-			local d = (screenPos - center).Magnitude
+			local d = (screenPos - activeCenter).Magnitude
 			if d > Aim.fov then return nil end
 			return d
 		end
@@ -536,28 +537,27 @@ local function main()
 		end)
 	end
 
-	local silentCircle = nil
-
 	local function updateCircle()
 		if not EX.draw then return end
 		local vp = CAM.ViewportSize
 		local center = Vector2.new(vp.X * .5, vp.Y * .5)
+		local activeCenter = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
 
-		-- cercle aimbot normal
 		if fovCircle then
-			fovCircle.Visible = Aim.on and Aim.showFov and not Aim.silent
-			if Aim.on and Aim.showFov and not Aim.silent then
-				fovCircle.Position = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
+			local showNormal = Aim.on and Aim.showFov and not Aim.silent
+			fovCircle.Visible = showNormal
+			if showNormal then
+				fovCircle.Position = activeCenter
 				fovCircle.Radius = Aim.fov
 				fovCircle.Color = Aim.target and C.on or Color3.fromRGB(Aim.fovColorR, Aim.fovColorG, Aim.fovColorB)
 			end
 		end
 
-		-- cercle silent aim
 		if silentCircle then
-			silentCircle.Visible = Aim.on and Aim.showFov and Aim.silent
-			if Aim.on and Aim.showFov and Aim.silent then
-				silentCircle.Position = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
+			local showSilent = Aim.on and Aim.showFov and Aim.silent
+			silentCircle.Visible = showSilent
+			if showSilent then
+				silentCircle.Position = activeCenter
 				silentCircle.Radius = Aim.silentFov
 				silentCircle.Color = Aim.target and C.on or Color3.fromRGB(Aim.silentColorR, Aim.silentColorG, Aim.silentColorB)
 			end
@@ -567,7 +567,6 @@ local function main()
 	local acquireAcc = 0
 	local function combatTick(dt)
 		if Aim.on then
-			-- throttle acquire à 30hz max pour éviter les freezes
 			acquireAcc += dt
 			if acquireAcc >= 0.033 then
 				acquireAcc = 0
@@ -1480,7 +1479,6 @@ local function main()
 				fps = math.floor(frames / acc)
 				acc, frames = 0, 0
 			end
-			-- mise à jour UI limitée à 10hz pour éviter les freezes
 			if uiAcc < 0.1 then continue end
 			uiAcc = 0
 			pcall(function()
@@ -1494,7 +1492,7 @@ local function main()
 						Aim.on and (Aim.silent and "silent" or "aimbot") or "off",
 						Flood.running and "run" or "idle")
 				end
-				aimLbl.Text = Aim.target and (Aim.target.Name .. " · " .. math.floor(Aim.fov) .. "px") or "none"
+				aimLbl.Text = Aim.target and (Aim.target.Name .. " · " .. math.floor(Aim.silent and Aim.silentFov or Aim.fov) .. "px") or "none"
 				floodLbl.TextColor3 = Flood.running and C.on or C.dim
 				if Flood.running then
 					floodLbl.Text = ("RUN %d fires · %d/%d parts"):format(Flood.fires, Flood.created, Flood.budget)
@@ -1571,8 +1569,6 @@ local function main()
 		end
 	end
 
-
-	-- drag du cercle FOV (aimbot + silent) avec clic droit maintenu sur le cercle
 	do
 		local dragging = false
 		local dragStart = nil
