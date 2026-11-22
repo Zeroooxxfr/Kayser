@@ -31,7 +31,7 @@ local function main()
 	-- 1. executor abstraction
 	--==========================================================
 	local EX = {
-		hook  = try(hookmetamethod) or (typeof(hookmetamethod) == "function" and hookmetamethod or nil),
+		hook  = (function() local ok, v = pcall(function() return hookmetamethod end) return ok and type(v) == "function" and v or nil end)(),
 		rawmt = try(getrawmetatable),
 		input = try(mouse1click),
 		clip  = try(setclipboard),
@@ -1603,7 +1603,7 @@ local function main()
 	log("executor:", tostring(EX.hint or "unknown"), "| hook:", EX.hook and "yes" or "no",
 		"| drawing:", EX.draw and "yes" or "no", "| io:", IO.ok and "yes" or "no")
 	notify("KAYSER 2.1 loaded · RightShift UI · END unload", 4)
-	if not EX.hook then notify("hookmetamethod missing: silent aim + wallbang inert", 6) end
+	if not EX.hook then notify("silent aim needs hookmetamethod — non supporté", 6) end
 
 	print("[K] boot complete · gui:", Gui.Parent and Gui.Parent:GetFullName() or "NIL",
 		"· enabled:", tostring(Gui.Enabled), "· size:", tostring(win.AbsoluteSize))
