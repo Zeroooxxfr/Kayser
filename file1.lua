@@ -533,31 +533,55 @@ local function main()
 		end)
 	end
 
-	local silentCircle = nil
+	-- 4 lignes pour le carré FOV silent aim
+	local silentSquare = {}
+	if EX.draw then
+		for i = 1, 4 do
+			local l = try(function() return Drawing.new("Line") end)
+			if l then
+				l.Thickness = 1.5
+				l.Transparency = .8
+				l.Color = Color3.fromRGB(255, 180, 60)
+				l.Visible = false
+				silentSquare[i] = l
+			end
+		end
+	end
 
 	local function updateCircle()
 		if not EX.draw then return end
 		local vp = CAM.ViewportSize
 		local center = Vector2.new(vp.X * .5, vp.Y * .5)
 
-		-- cercle aimbot normal
+		-- cercle aimbot (toujours centré sur offset)
 		if fovCircle then
-			fovCircle.Visible = Aim.on and not Aim.silent
-			if Aim.on and not Aim.silent then
-				fovCircle.Position = center
-				fovCircle.Radius = Aim.fov
-				fovCircle.Color = Aim.target and C.on or C.accent
+			fovCircle.Visible = Aim.on
+			if Aim.on then
+				fovCircle.Position = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
+				fovCircle.Radius = Aim.silent and Aim.silentFov or Aim.fov
+				fovCircle.Color = Aim.target and C.on or (Aim.silent and Color3.fromRGB(255,180,60) or C.accent)
 			end
 		end
 
-		-- cercle silent aim (déplaçable)
-		if silentCircle then
-			silentCircle.Visible = Aim.on and Aim.silent
-			if Aim.on and Aim.silent then
-				silentCircle.Position = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
-				silentCircle.Radius = Aim.silentFov
-				silentCircle.Color = Aim.target and C.on or Color3.fromRGB(255, 180, 60)
+		-- carré FOV silent aim
+		local showSquare = Aim.on and Aim.silent and #silentSquare == 4
+		if showSquare then
+			local cx = center.X + Aim.silentOffsetX
+			local cy = center.Y + Aim.silentOffsetY
+			local r = Aim.silentFov
+			local tl = Vector2.new(cx - r, cy - r)
+			local tr = Vector2.new(cx + r, cy - r)
+			local br = Vector2.new(cx + r, cy + r)
+			local bl = Vector2.new(cx - r, cy + r)
+			local corners = { {tl,tr},{tr,br},{br,bl},{bl,tl} }
+			for i, pair in ipairs(corners) do
+				silentSquare[i].From = pair[1]
+				silentSquare[i].To   = pair[2]
+				silentSquare[i].Visible = true
+				silentSquare[i].Color = Aim.target and C.on or Color3.fromRGB(255,180,60)
 			end
+		else
+			for _, l in ipairs(silentSquare) do l.Visible = false end
 		end
 	end
 
@@ -1488,10 +1512,8 @@ local function main()
 			pcall(function() fovCircle:Remove() end)
 			fovCircle = nil
 		end
-		if silentCircle then
-			pcall(function() silentCircle:Remove() end)
-			silentCircle = nil
-		end
+		for _, l in ipairs(silentSquare) do pcall(function() l:Remove() end) end
+		silentSquare = {}
 		for p, set in pairs(ESP) do
 			for _, o in pairs(set) do pcall(function() o:Destroy() end) end
 			ESP[p] = nil
@@ -1546,26 +1568,27 @@ local function main()
 		end
 	end
 
-	-- drag du cercle silent aim avec clic droit maintenu
+	-- drag du cercle FOV (aimbot + silent) avec clic droit maintenu sur le cercle
 	do
 		local dragging = false
 		local dragStart = nil
 		local offsetStart = nil
-		State.conns.silentDrag = UserInputService.InputBegan:Connect(function(i, processed)
+		State.conns.fovDrag = UserInputService.InputBegan:Connect(function(i, processed)
 			if processed then return end
-			if i.UserInputType == Enum.UserInputType.MouseButton2 and Aim.silent then
+			if i.UserInputType == Enum.UserInputType.MouseButton2 then
 				local vp = CAM.ViewportSize
 				local center = Vector2.new(vp.X * .5, vp.Y * .5)
 				local circleCenter = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
 				local mousePos = Vector2.new(i.Position.X, i.Position.Y)
-				if (mousePos - circleCenter).Magnitude <= Aim.silentFov + 12 then
+				local activeRadius = Aim.silent and Aim.silentFov or Aim.fov
+				if (mousePos - circleCenter).Magnitude <= activeRadius + 16 then
 					dragging = true
 					dragStart = mousePos
 					offsetStart = Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
 				end
 			end
 		end)
-		State.conns.silentDragMove = UserInputService.InputChanged:Connect(function(i)
+		State.conns.fovDragMove = UserInputService.InputChanged:Connect(function(i)
 			if not dragging then return end
 			if i.UserInputType == Enum.UserInputType.MouseMovement then
 				local delta = Vector2.new(i.Position.X, i.Position.Y) - dragStart
@@ -1575,7 +1598,7 @@ local function main()
 				if Widgets.sliders["Silent FOV offset Y"] then Widgets.sliders["Silent FOV offset Y"].set(math.floor(Aim.silentOffsetY)) end
 			end
 		end)
-		State.conns.silentDragEnd = UserInputService.InputEnded:Connect(function(i)
+		State.conns.fovDragEnd = UserInputService.InputEnded:Connect(function(i)
 			if i.UserInputType == Enum.UserInputType.MouseButton2 then
 				dragging = false
 			end
