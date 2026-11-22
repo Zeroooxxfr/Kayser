@@ -16,7 +16,7 @@ local function main()
 	local HttpService         = game:GetService("HttpService")
 	local VirtualInputManager = game:GetService("VirtualInputManager")
 
-	local PLR = Players.LocalPlayer
+	local player = Players.LocalPlayer
 	local CAM = workspace.CurrentCamera
 
 	local function try(fn, ...)
@@ -56,7 +56,7 @@ local function main()
 	local function hook(signal, fn) return signal:Connect(fn) end
 
 	--==========================================================
-	-- 2. state
+	-- 2. state & config
 	--==========================================================
 	local State = {
 		esp = false, fullbright = false, noclip = false, fly = false,
@@ -65,6 +65,21 @@ local function main()
 		waypoints = {}, conns = {}, flyParts = nil, light = nil, killed = false,
 		spectating = nil,
 	}
+
+	local Config = {
+		Fly = { Enabled = false },
+		WalkFling = {
+			Enabled = false,
+			Power = 9e7,
+			Spin = true,
+			TriggerRange = 10,
+			OnlyNearPlayers = true,
+			HeavyBody = true,
+			SafeReturn = false,
+			SafeReturnDistance = 50,
+		}
+	}
+
 	local Widgets = { toggles = {}, sliders = {} }
 	local ESP, Hitboxes = {}, {}
 	local Features = {}
@@ -97,7 +112,7 @@ local function main()
 
 	local function attach(o)
 		local hosts = {}
-		local pg = PLR:FindFirstChildOfClass("PlayerGui") or PLR:WaitForChild("PlayerGui", 10)
+		local pg = player:FindFirstChildOfClass("PlayerGui") or player:WaitForChild("PlayerGui", 10)
 		if pg then table.insert(hosts, pg) end
 		table.insert(hosts, function() return try(gethui) end)
 		table.insert(hosts, function() return game:GetService("CoreGui") end)
@@ -105,10 +120,7 @@ local function main()
 			local host = type(h) == "function" and try(h) or h
 			if host then
 				local ok = pcall(function() o.Parent = host end)
-				if ok then
-					task.wait(.1)
-					if o.Parent then return true end
-				end
+				if ok then return true end
 			end
 		end
 		return false
@@ -383,16 +395,16 @@ local function main()
 	--==========================================================
 	-- 4. core helpers
 	--==========================================================
-	local function charPart()
-		local ch = PLR.Character
-		return ch, ch and ch:FindFirstChild("HumanoidRootPart"), ch and ch:FindFirstChildOfClass("Humanoid")
+	local function getChar()
+		local ch = player.Character
+		return ch, ch and ch:FindFirstChildOfClass("Humanoid"), ch and ch:FindFirstChild("HumanoidRootPart")
 	end
 
 	local rawRaycast = workspace.Raycast
-	local mouse = try(function() return PLR:GetMouse() end)
+	local mouse = try(function() return player:GetMouse() end)
 
 	local function applyMovement()
-		local _, _, hum = charPart()
+		local _, hum = getChar()
 		if not hum then return end
 		hum.WalkSpeed = math.max(1, State.baseSpeed + State.addSpeed)
 		hum.UseJumpPower = true
@@ -400,7 +412,7 @@ local function main()
 	end
 
 	--==========================================================
-	-- 5. combat engine, skidfling, walkfling, anti-fling & spectate
+	-- 5. combat engine, walkfling implementation & anti-freeze
 	--==========================================================
 	local Aim = {
 		on = false, silent = false, wallbang = false, hitbox = false, autoFire = false,
@@ -413,26 +425,125 @@ local function main()
 	}
 	local Rapid = { on = false, rate = .05, acc = 0, aimFire = false }
 	local SkidFlingAll = { on = false }
-	
-	-- Pass-by / Touch WalkFling Settings
-	local WalkFling = {
-		on = false,
-		range = 10,
-		power = 9e7,
-	}
 
-	-- Anti-Fling & Anti-Freeze State
-	local AntiFling = {
-		on = false,
-	}
+	-- Walkfling State & Logic requested by user
+	local flingVel = Vector3.zero
+	local flingAng = Vector3.zero
+	local flingActive = false
+	local flingSavedProps = {}
+	local flingMassOn = false
+	local flingChar = nil
+	local lastSafeCF = nil
+
+	local function setFlingMass(on)
+		if on then
+			local char = player.Character
+			if flingChar ~= char then
+				table.clear(flingSavedProps)
+				flingChar = char
+			end
+			if char then
+				for _, p in ipairs(char:GetDescendants()) do
+					if p:IsA("BasePart") then
+						if flingSavedProps[p] == nil then
+							flingSavedProps[p] = p.CustomPhysicalProperties or false
+						end
+						p.CustomPhysicalProperties = PhysicalProperties.new(100, 0.3, 0.5, 1, 1)
+					end
+				end
+			end
+			flingMassOn = true
+		else
+			for p, saved in pairs(flingSavedProps) do
+				if p.Parent then p.CustomPhysicalProperties = saved or nil end
+			end
+			table.clear(flingSavedProps)
+			flingMassOn = false
+		end
+	end
+
+	local function nearOtherPlayer(root, range)
+		for _, other in ipairs(Players:GetPlayers()) do
+			if other ~= player then
+				local r = other.Character and other.Character:FindFirstChild("HumanoidRootPart")
+				if r and (r.Position - root.Position).Magnitude <= range then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	RunService.Heartbeat:Connect(function()
+		local wf = Config.WalkFling
+		local active = wf.Enabled and not Config.Fly.Enabled
+		if not active then
+			if flingMassOn then setFlingMass(false) end
+			lastSafeCF = nil
+			return
+		end
+
+		local char, _, root = getChar()
+		if not root then return end
+
+		if wf.HeavyBody and (not flingMassOn or flingChar ~= player.Character) then
+			setFlingMass(true)
+		end
+
+		if wf.SafeReturn and lastSafeCF
+			and (root.Position - lastSafeCF.Position).Magnitude > wf.SafeReturnDistance then
+			char:PivotTo(lastSafeCF)
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			return
+		end
+
+		if wf.OnlyNearPlayers and not nearOtherPlayer(root, wf.TriggerRange) then
+			if wf.SafeReturn then lastSafeCF = root.CFrame end
+			return
+		end
+
+		flingVel = root.AssemblyLinearVelocity
+		flingAng = root.AssemblyAngularVelocity
+
+		local base = flingVel
+		if Vector3.new(base.X, 0, base.Z).Magnitude < 1 then
+			base = root.CFrame.LookVector * 16
+		end
+
+		flingActive = true
+		root.AssemblyLinearVelocity = base * wf.Power + Vector3.new(0, wf.Power, 0)
+		if wf.Spin then
+			root.AssemblyAngularVelocity = Vector3.new(0, wf.Power, 0)
+		end
+	end)
+
+	RunService.RenderStepped:Connect(function()
+		if not flingActive then return end
+		local _, _, root = getChar()
+		if root then
+			root.AssemblyLinearVelocity = flingVel
+			root.AssemblyAngularVelocity = flingAng
+		end
+	end)
+
+	RunService.Stepped:Connect(function()
+		if not flingActive then return end
+		flingActive = false
+		local _, _, root = getChar()
+		if root then
+			root.AssemblyLinearVelocity = flingVel + Vector3.new(0, 0.1, 0)
+			root.AssemblyAngularVelocity = flingAng
+		end
+	end)
 
 	local Hooks = { on = false, orig = nil }
 	local fovCircle = nil
 	local silentCircle = nil
 
 	local Whitelist = {}
-	local function IsWhitelisted(player)
-		local nameLower = player.Name:lower()
+	local function IsWhitelisted(p)
+		local nameLower = p.Name:lower()
 		for _, wl in ipairs(Whitelist) do
 			if wl:lower() == nameLower then return true end
 		end
@@ -530,10 +641,10 @@ local function main()
 
 	local function acquire()
 		local best, bestScore, bestPos
-		local _, myRoot = charPart()
+		local _, _, myRoot = getChar()
 		for _, p in ipairs(Players:GetPlayers()) do
-			local skipTeam = Aim.ignoreTeam and PLR.Team ~= nil and p.Team == PLR.Team
-			if p ~= PLR and not skipTeam then
+			local skipTeam = Aim.ignoreTeam and player.Team ~= nil and p.Team == player.Team
+			if p ~= player and not skipTeam then
 				local ch, _, head = bodyOf(p)
 				if ch and head then
 					local dist = myRoot and (head.Position - myRoot.Position).Magnitude or 0
@@ -550,7 +661,7 @@ local function main()
 	end
 
 	local function pressFire()
-		local ch = PLR.Character
+		local ch = player.Character
 		local tool = ch and ch:FindFirstChildOfClass("Tool")
 		if tool then
 			pcall(function() tool:Activate() end)
@@ -598,7 +709,7 @@ local function main()
 		if not TargetPlayer or not TargetPlayer.Parent then return false end
 		if IsPlayerSeated(TargetPlayer) then return false end
 
-		local Character = PLR.Character
+		local Character = player.Character
 		local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
 		local RootPart = Humanoid and Humanoid.RootPart
 
@@ -714,50 +825,6 @@ local function main()
 		return true
 	end
 
-	-- Pass-by / Touch WalkFling implementation (flings players in front/near without anchoring or freezing self)
-	local function walkFlingTick()
-		if not WalkFling.on then return end
-		local ch, root, hum = charPart()
-		if not root or not hum then return end
-
-		for _, p in ipairs(Players:GetPlayers()) do
-			if p ~= PLR and not IsWhitelisted(p) then
-				local pch, _, phrp = bodyOf(p)
-				if phrp then
-					local dist = (phrp.Position - root.Position).Magnitude
-					if dist <= WalkFling.range then
-						pcall(function()
-							phrp.AssemblyLinearVelocity = Vector3.new(WalkFling.power, WalkFling.power, WalkFling.power)
-							phrp.AssemblyRotVelocity = Vector3.new(WalkFling.power, WalkFling.power, WalkFling.power)
-						end)
-					end
-				end
-			end
-		end
-	end
-
-	-- Anti-Fling & Anti-Freeze Loop (Nullifies extreme incoming velocities and clears rotational locks)
-	local function antiFlingTick()
-		if not AntiFling.on then return end
-		local ch, root, hum = charPart()
-		if not root then return end
-
-		pcall(function()
-			if root.AssemblyLinearVelocity.Magnitude > 300 or root.AssemblyRotVelocity.Magnitude > 300 then
-				root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-				root.AssemblyRotVelocity = Vector3.new(0, 0, 0)
-			end
-			for _, part in ipairs(ch:GetDescendants()) do
-				if part:IsA("BasePart") then
-					part.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.3, 0, 1, 1)
-					if part.Velocity.Magnitude > 300 then
-						part.Velocity = Vector3.new(0, 0, 0)
-					end
-				end
-			end
-		end)
-	end
-
 	local acquireAcc = 0
 	local function combatTick(dt)
 		if Aim.on then
@@ -782,14 +849,6 @@ local function main()
 			end
 		end
 
-		if WalkFling.on then
-			walkFlingTick()
-		end
-
-		if AntiFling.on then
-			antiFlingTick()
-		end
-
 		if State.spectating then
 			local targetPlr = Players:FindFirstChild(State.spectating)
 			local ch = targetPlr and targetPlr.Character
@@ -797,17 +856,17 @@ local function main()
 			if head then
 				CAM.CameraSubject = head
 			else
-				CAM.CameraSubject = PLR.Character and PLR.Character:FindFirstChildOfClass("Humanoid")
+				CAM.CameraSubject = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 			end
 		end
 	end
 
 	local function ensureCombat()
-		if Aim.on or Rapid.on or SkidFlingAll.on or WalkFling.on or AntiFling.on or State.spectating then
+		if Aim.on or Rapid.on or SkidFlingAll.on or Config.WalkFling.Enabled or State.spectating then
 			if not State.conns.combat then
 				State.conns.combat = hook(RunService.RenderStepped, combatTick)
 			end
-		elseif State.conns.combat and not (Aim.on or Rapid.on or SkidFlingAll.on or WalkFling.on or AntiFling.on or State.spectating) then
+		elseif State.conns.combat and not (Aim.on or Rapid.on or SkidFlingAll.on or Config.WalkFling.Enabled or State.spectating) then
 			State.conns.combat:Disconnect()
 			State.conns.combat = nil
 			Aim.target, Aim.headPos = nil, nil
@@ -822,7 +881,7 @@ local function main()
 			if SkidFlingAll.on then
 				local targets = {}
 				for _, p in ipairs(Players:GetPlayers()) do
-					if p ~= PLR and not IsWhitelisted(p) then
+					if p ~= player and not IsWhitelisted(p) then
 						table.insert(targets, p)
 					end
 				end
@@ -835,12 +894,12 @@ local function main()
 						if not target or not target.Parent then continue end
 						if IsWhitelisted(target) then continue end
 
-						local char = PLR.Character
+						local char = player.Character
 						local hum = char and char:FindFirstChildOfClass("Humanoid")
 						if not char or not char.Parent or not hum or hum.Health <= 0 then
 							repeat
 								task.wait(0.5)
-								char = PLR.Character
+								char = player.Character
 								hum = char and char:FindFirstChildOfClass("Humanoid")
 							until char and char.Parent and hum and hum.Health > 0
 							task.wait(1)
@@ -872,7 +931,7 @@ local function main()
 	end
 
 	local function makeHitbox(p)
-		if Hitboxes[p] or p == PLR then return end
+		if Hitboxes[p] or p == player then return end
 		local ch = p.Character
 		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
 		if not hrp then return end
@@ -911,7 +970,7 @@ local function main()
 	function Features.esp(on)
 		State.esp = on
 		local function build(p)
-			if p == PLR or ESP[p] then return end
+			if p == player or ESP[p] then return end
 			local ch = p.Character
 			if not (ch and ch:FindFirstChild("Head")) then return end
 			local set = {}
@@ -945,7 +1004,7 @@ local function main()
 				acc += dt
 				if acc < 1 then return end
 				acc = 0
-				local _, root = charPart()
+				local _, _, root = getChar()
 				for p, set in pairs(ESP) do
 					local ch = p.Character
 					local head = ch and ch:FindFirstChild("Head")
@@ -984,7 +1043,7 @@ local function main()
 		if State.conns.noclip then State.conns.noclip:Disconnect() end
 		if on then
 			State.conns.noclip = hook(RunService.Stepped, function()
-				local ch = PLR.Character
+				local ch = player.Character
 				if not ch then return end
 				for _, p in ipairs(ch:GetDescendants()) do
 					if p:IsA("BasePart") then p.CanCollide = false end
@@ -995,10 +1054,12 @@ local function main()
 
 	function Features.fly(on)
 		State.fly = on
-		local _, hrp = charPart()
+		Config.Fly.Enabled = on
+		local _, _, hrp = getChar()
 		if on then
 			if not hrp then
 				State.fly = false
+				Config.Fly.Enabled = false
 				return notify("no character")
 			end
 			State.flyParts = {
@@ -1006,7 +1067,7 @@ local function main()
 				new("BodyGyro", { Name = "KAYSER_G", MaxTorque = Vector3.new(1e5, 1e5, 1e5), P = 2000, D = 60, Parent = hrp }),
 			}
 			State.conns.fly = hook(RunService.RenderStepped, function()
-				local _, root = charPart()
+				local _, _, root = getChar()
 				if not root or not State.flyParts[1].Parent then return end
 				local cf = CAM.CFrame
 				local mv = Vector3.zero
@@ -1034,7 +1095,7 @@ local function main()
 		if State.conns.infJump then State.conns.infJump:Disconnect() end
 		if on then
 			State.conns.infJump = hook(UserInputService.JumpRequest, function()
-				local _, _, hum = charPart()
+				local _, hum = getChar()
 				if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
 			end)
 		end
@@ -1048,7 +1109,7 @@ local function main()
 		end
 		if on then
 			State.conns.void = hook(RunService.Heartbeat, function()
-				local ch, root = charPart()
+				local ch, _, root = getChar()
 				if not ch or not root then return end
 				if root.Position.Y > State.voidY + 15 then
 					State.safeCF = root.CFrame
@@ -1073,7 +1134,7 @@ local function main()
 	end
 
 	function Features.teleport(cf)
-		local ch = charPart()
+		local ch = getChar()
 		if not ch or not cf then return end
 		pcall(function() ch:PivotTo(cf + Vector3.new(0, 3, 0)) end)
 	end
@@ -1082,7 +1143,7 @@ local function main()
 		local loc = UserInputService:GetMouseLocation()
 		local ray = CAM:ViewportPointToRay(loc.X, loc.Y)
 		local params = RaycastParams.new()
-		params.FilterDescendantsInstances = { PLR.Character }
+		params.FilterDescendantsInstances = { player.Character }
 		local res = workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
 		Features.teleport(CFrame.new(res and res.Position or (ray.Origin + ray.Direction * 200)))
 	end
@@ -1097,7 +1158,7 @@ local function main()
 	function Features.spectatePlayer(name)
 		if name == "" or name == State.spectating then
 			State.spectating = nil
-			CAM.CameraSubject = PLR.Character and PLR.Character:FindFirstChildOfClass("Humanoid")
+			CAM.CameraSubject = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 			notify("spectate off")
 		else
 			State.spectating = name
@@ -1126,7 +1187,7 @@ local function main()
 	end
 
 	function Features.saveWaypoint(name)
-		local _, hrp = charPart()
+		local _, _, hrp = getChar()
 		if not hrp or name == "" then return notify("invalid waypoint") end
 		State.waypoints[name] = hrp.CFrame
 		persistWaypoints()
@@ -1150,7 +1211,7 @@ local function main()
 	local function isOurs(inst)
 		local p = inst
 		while p and p ~= workspace do
-			if p == spamFolder or p == PLR.Character then return true end
+			if p == spamFolder or p == player.Character then return true end
 			p = p.Parent
 		end
 		return false
@@ -1188,7 +1249,7 @@ local function main()
 		local ch = plr and plr.Character
 		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
 		if hrp then return hrp.CFrame end
-		local _, mine = charPart()
+		local _, _, mine = getChar()
 		return mine and mine.CFrame or CFrame.new()
 	end
 
@@ -1371,18 +1432,14 @@ local function main()
 		ensureCombat()
 		notify("skidfling all " .. (v and "on" or "off"))
 	end, "loops through all targets with SkidFling")
-	toggle(cFire, "WalkFling (Pass-by)", false, function(v)
-		WalkFling.on = v
+	toggle(cFire, "WalkFling (Custom Loop)", false, function(v)
+		Config.WalkFling.Enabled = v
 		ensureCombat()
 		notify("walkfling " .. (v and "on" or "off"))
-	end, "flings players when passing near/in front without self-freeze")
-	slider(cFire, "WalkFling Range", 4, 30, 10, function(v) WalkFling.range = v end)
-	slider(cFire, "WalkFling Power", 1e6, 5e8, 9e7, function(v) WalkFling.power = v end)
-	toggle(cFire, "Anti-Fling / Anti-Freeze", false, function(v)
-		AntiFling.on = v
-		ensureCombat()
-		notify("anti-fling " .. (v and "on" or "off"))
-	end, "blocks incoming fling forces and unfreezes you")
+	end, "custom pass-by fling loop")
+	slider(cFire, "WalkFling Range", 4, 30, 10, function(v) Config.WalkFling.TriggerRange = v end)
+	slider(cFire, "WalkFling Power", 1e6, 5e8, 9e7, function(v) Config.WalkFling.Power = v end)
+	toggle(cFire, "WalkFling Spin", true, function(v) Config.WalkFling.Spin = v end)
 
 	local cAimState = card(pCombat, 40)
 	header(cAimState, "target")
@@ -1482,7 +1539,7 @@ local function main()
 			if c:IsA("Frame") then c:Destroy() end
 		end
 		for _, p in ipairs(Players:GetPlayers()) do
-			if p ~= PLR then
+			if p ~= player then
 				local ch = p.Character
 				local hum = ch and ch:FindFirstChildOfClass("Humanoid")
 				local r = new("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, Parent = plrList })
@@ -1516,7 +1573,7 @@ local function main()
 		while not State.killed and Gui.Parent do
 			local sig = ""
 			for _, p in ipairs(Players:GetPlayers()) do
-				if p ~= PLR then
+				if p ~= player then
 					local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
 					sig ..= p.Name .. (hum and math.floor(hum.Health) or "-") .. "|"
 				end
@@ -1716,7 +1773,7 @@ local function main()
 
 	local cSess = card(pMain)
 	header(cSess, "session")
-	button(cSess, "Rejoin", function() game:GetService("TeleportService"):Teleport(game.PlaceId, PLR) end)
+	button(cSess, "Rejoin", function() game:GetService("TeleportService"):Teleport(game.PlaceId, player) end)
 	button(cSess, "Copy JobId", function()
 		if EX.clip then
 			pcall(EX.clip, game.JobId)
@@ -1749,7 +1806,7 @@ local function main()
 		end
 	end)
 
-	State.conns.char = PLR.CharacterAdded:Connect(function()
+	State.conns.char = player.CharacterAdded:Connect(function()
 		task.wait(.6)
 		if State.killed then return end
 		if State.fly then
@@ -1760,7 +1817,7 @@ local function main()
 	end)
 
 	do
-		local _, _, hum = charPart()
+		local _, hum = getChar()
 		if hum then
 			State.baseSpeed = hum.WalkSpeed
 			State.baseJump = hum.JumpPower > 0 and hum.JumpPower or 50
@@ -1832,8 +1889,8 @@ local function main()
 		spamFolder:Destroy()
 		if EX.fps then pcall(EX.fps, 60) end
 		CAM.FieldOfView = State.baseFov
-		CAM.CameraSubject = PLR.Character and PLR.Character:FindFirstChildOfClass("Humanoid")
-		local _, _, hum = charPart()
+		CAM.CameraSubject = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		local _, hum = getChar()
 		if hum then
 			hum.WalkSpeed = State.baseSpeed
 			if State.baseJump > 0 then
