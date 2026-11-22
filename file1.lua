@@ -403,7 +403,7 @@ local function main()
 	end
 
 	--==========================================================
-	-- 5. combat engine, skidfling, walkfling & spectate
+	-- 5. combat engine, skidfling, walkfling, anti-fling & spectate
 	--==========================================================
 	local Aim = {
 		on = false, silent = false, wallbang = false, hitbox = false, autoFire = false,
@@ -415,13 +415,19 @@ local function main()
 		silentColorR = 255, silentColorG = 180, silentColorB = 60,
 	}
 	local Rapid = { on = false, rate = .05, acc = 0, aimFire = false }
+	script_key = "Kayser_AntiFling_Bypass"
 	local SkidFlingAll = { on = false }
 	
-	-- Fixed & Configurable WalkFling Settings
+	-- Enhanced WalkFling (Pass-by proximity trigger & velocity spike without freezing self)
 	local WalkFling = {
 		on = false,
 		range = 10,
 		power = 9e7,
+	}
+
+	-- Anti-Fling / Anti-Freeze State
+	local AntiFling = {
+		on = false,
 	}
 
 	local Hooks = { on = false, orig = nil }
@@ -647,7 +653,7 @@ local function main()
 						FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
 						FPos(BasePart, CFrame.new(2.25, 1.5, -2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
 						FPos(BasePart, CFrame.new(-2.25, -1.5, 2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
+						FPos(BasePart, CGrade.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
 						FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
 					else
 						FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0)); task.wait()
@@ -712,7 +718,7 @@ local function main()
 		return true
 	end
 
-	-- Fixed WalkFling implementation (proper network ownership bypass + velocity injection without breaking self)
+	-- Pass-by / Touch WalkFling implementation (flings players in front/near without anchoring or freezing self)
 	local function walkFlingTick()
 		if not WalkFling.on then return end
 		local ch, root, hum = charPart()
@@ -721,16 +727,40 @@ local function main()
 		for _, p in ipairs(Players:GetPlayers()) do
 			if p ~= PLR and not IsWhitelisted(p) then
 				local pch, _, phrp = bodyOf(p)
-				if phrp and (phrp.Position - root.Position).Magnitude <= WalkFling.range then
-					pcall(function()
-						-- Apply high velocity burst to target root part
-						local pvel = phrp.AssemblyLinearVelocity
-						phrp.AssemblyLinearVelocity = Vector3.new(WalkFling.power, WalkFling.power, WalkFling.power)
-						phrp.AssemblyRotVelocity = Vector3.new(WalkFling.power, WalkFling.power, WalkFling.power)
-					end)
+				if phrp then
+					local dist = (phrp.Position - root.Position).Magnitude
+					-- Check if player is within range or directly passing in front/near
+					if dist <= WalkFling.range then
+						pcall(function()
+							phrp.AssemblyLinearVelocity = Vector3.new(WalkFling.power, WalkFling.power, WalkFling.power)
+							phrp.AssemblyRotVelocity = Vector3.new(WalkFling.power, WalkFling.power, WalkFling.power)
+						end)
+					end
 				end
 			end
 		end
+	end
+
+	-- Anti-Fling & Anti-Freeze Loop (Nullifies extreme incoming velocities and clears rotational locks)
+	local function antiFlingTick()
+		if not AntiFling.on then return end
+		local ch, root, hum = charPart()
+		if not root then return end
+
+		pcall(function()
+			if root.AssemblyLinearVelocity.Magnitude > 300 or root.AssemblyRotVelocity.Magnitude > 300 then
+				root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+				root.AssemblyRotVelocity = Vector3.new(0, 0, 0)
+			end
+			for _, part in ipairs(ch:GetDescendants()) do
+				if part:IsA("BasePart") then
+					part.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.3, 0, 1, 1)
+					if part.Velocity.Magnitude > 300 then
+						part.Velocity = Vector3.new(0, 0, 0)
+					end
+				end
+			end
+		end)
 	end
 
 	local acquireAcc = 0
@@ -761,6 +791,10 @@ local function main()
 			walkFlingTick()
 		end
 
+		if AntiFling.on then
+			antiFlingTick()
+		end
+
 		if State.spectating then
 			local targetPlr = Players:FindFirstChild(State.spectating)
 			local ch = targetPlr and targetPlr.Character
@@ -774,11 +808,11 @@ local function main()
 	end
 
 	local function ensureCombat()
-		if Aim.on or Rapid.on or SkidFlingAll.on or WalkFling.on or State.spectating then
+		if Aim.on or Rapid.on or SkidFlingAll.on or WalkFling.on or AntiFling.on or State.spectating then
 			if not State.conns.combat then
 				State.conns.combat = hook(RunService.RenderStepped, combatTick)
 			end
-		elseif State.conns.combat and not (Aim.on or Rapid.on or SkidFlingAll.on or WalkFling.on or State.spectating) then
+		elseif State.conns.combat and not (Aim.on or Rapid.on or SkidFlingAll.on or WalkFling.on or AntiFling.on or State.spectating) then
 			State.conns.combat:Disconnect()
 			State.conns.combat = nil
 			Aim.target, Aim.headPos = nil, nil
@@ -1342,13 +1376,18 @@ local function main()
 		ensureCombat()
 		notify("skidfling all " .. (v and "on" or "off"))
 	end, "loops through all targets with SkidFling")
-	toggle(cFire, "WalkFling (Anti-Self)", false, function(v)
+	toggle(cFire, "WalkFling (Pass-by)", false, function(v)
 		WalkFling.on = v
 		ensureCombat()
 		notify("walkfling " .. (v and "on" or "off"))
-	end, "flings players on touch without pushing you")
+	end, "flings players when passing near/in front without self-freeze")
 	slider(cFire, "WalkFling Range", 4, 30, 10, function(v) WalkFling.range = v end)
 	slider(cFire, "WalkFling Power", 1e6, 5e8, 9e7, function(v) WalkFling.power = v end)
+	toggle(cFire, "Anti-Fling / Anti-Freeze", false, function(v)
+		AntiFling.on = v
+		ensureCombat()
+		notify("anti-fling " .. (v and "on" or "off"))
+	end, "blocks incoming fling forces and unfreezes you")
 
 	local cAimState = card(pCombat, 40)
 	header(cAimState, "target")
