@@ -107,16 +107,13 @@ local function main()
 				local ok = pcall(function() o.Parent = host end)
 				if ok then
 					task.wait(.1)
-					if o.Parent then
-						print("[K] attached to " .. o.Parent:GetFullName())
-						return true
-					end
+					if o.Parent then return true end
 				end
 			end
 		end
 		return false
 	end
-	if not attach(Gui) then warn("[K] attach failed — no renderable host") end
+	attach(Gui)
 
 	local win = new("Frame", {
 		Size = UDim2.fromOffset(660, 430), Position = UDim2.fromScale(.5, .5),
@@ -415,17 +412,16 @@ local function main()
 		silentColorR = 255, silentColorG = 180, silentColorB = 60,
 	}
 	local Rapid = { on = false, rate = .05, acc = 0, aimFire = false }
-	script_key = "Kayser_AntiFling_Bypass"
 	local SkidFlingAll = { on = false }
 	
-	-- Enhanced WalkFling (Pass-by proximity trigger & velocity spike without freezing self)
+	-- Pass-by / Touch WalkFling Settings
 	local WalkFling = {
 		on = false,
 		range = 10,
 		power = 9e7,
 	}
 
-	-- Anti-Fling / Anti-Freeze State
+	-- Anti-Fling & Anti-Freeze State
 	local AntiFling = {
 		on = false,
 	}
@@ -653,7 +649,7 @@ local function main()
 						FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
 						FPos(BasePart, CFrame.new(2.25, 1.5, -2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
 						FPos(BasePart, CFrame.new(-2.25, -1.5, 2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
-						FPos(BasePart, CGrade.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
+						FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
 						FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
 					else
 						FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0)); task.wait()
@@ -729,7 +725,6 @@ local function main()
 				local pch, _, phrp = bodyOf(p)
 				if phrp then
 					local dist = (phrp.Position - root.Position).Magnitude
-					-- Check if player is within range or directly passing in front/near
 					if dist <= WalkFling.range then
 						pcall(function()
 							phrp.AssemblyLinearVelocity = Vector3.new(WalkFling.power, WalkFling.power, WalkFling.power)
