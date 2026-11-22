@@ -426,7 +426,7 @@ local function main()
 	local Rapid = { on = false, rate = .05, acc = 0, aimFire = false }
 	local SkidFlingAll = { on = false }
 
-	-- Walkfling State & Logic requested by user
+	-- Walkfling State & Logic requested by user (anti-fling removed)
 	local flingVel = Vector3.zero
 	local flingAng = Vector3.zero
 	local flingActive = false
