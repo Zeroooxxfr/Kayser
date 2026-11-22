@@ -416,7 +416,14 @@ local function main()
 	}
 	local Rapid = { on = false, rate = .05, acc = 0, aimFire = false }
 	local SkidFlingAll = { on = false }
-	local WalkFling = { on = false }
+	
+	-- Fixed & Configurable WalkFling Settings
+	local WalkFling = {
+		on = false,
+		range = 10,
+		power = 9e7,
+	}
+
 	local Hooks = { on = false, orig = nil }
 	local fovCircle = nil
 	local silentCircle = nil
@@ -705,22 +712,22 @@ local function main()
 		return true
 	end
 
-	-- WalkFling implementation (flings others on touch without flinging self)
+	-- Fixed WalkFling implementation (proper network ownership bypass + velocity injection without breaking self)
 	local function walkFlingTick()
 		if not WalkFling.on then return end
 		local ch, root, hum = charPart()
-		if not root then return end
+		if not root or not hum then return end
 
 		for _, p in ipairs(Players:GetPlayers()) do
 			if p ~= PLR and not IsWhitelisted(p) then
 				local pch, _, phrp = bodyOf(p)
-				if phrp and (phrp.Position - root.Position).Magnitude < 8 then
-					local oldAnchor = root.Anchored
-					root.Anchored = true
-					phrp.AssemblyLinearVelocity = Vector3.new(9e7, 9e8, 9e7)
-					phrp.AssemblyRotVelocity = Vector3.new(9e8, 9e8, 9e8)
-					task.wait(0.03)
-					root.Anchored = oldAnchor
+				if phrp and (phrp.Position - root.Position).Magnitude <= WalkFling.range then
+					pcall(function()
+						-- Apply high velocity burst to target root part
+						local pvel = phrp.AssemblyLinearVelocity
+						phrp.AssemblyLinearVelocity = Vector3.new(WalkFling.power, WalkFling.power, WalkFling.power)
+						phrp.AssemblyRotVelocity = Vector3.new(WalkFling.power, WalkFling.power, WalkFling.power)
+					end)
 				end
 			end
 		end
@@ -1340,6 +1347,8 @@ local function main()
 		ensureCombat()
 		notify("walkfling " .. (v and "on" or "off"))
 	end, "flings players on touch without pushing you")
+	slider(cFire, "WalkFling Range", 4, 30, 10, function(v) WalkFling.range = v end)
+	slider(cFire, "WalkFling Power", 1e6, 5e8, 9e7, function(v) WalkFling.power = v end)
 
 	local cAimState = card(pCombat, 40)
 	header(cAimState, "target")
