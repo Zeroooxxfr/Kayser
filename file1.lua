@@ -63,6 +63,7 @@ local function main()
 		infJump = false, antiVoid = false, voidY = -60, safeCF = nil,
 		baseSpeed = 16, baseJump = 50, baseFov = 70, addSpeed = 0, addJump = 0,
 		waypoints = {}, conns = {}, flyParts = nil, light = nil, killed = false,
+		spectating = nil,
 	}
 	local Widgets = { toggles = {}, sliders = {} }
 	local ESP, Hitboxes = {}, {}
@@ -402,7 +403,7 @@ local function main()
 	end
 
 	--==========================================================
-	-- 5. combat engine
+	-- 5. combat engine, fling all, walkfling & spectate
 	--==========================================================
 	local Aim = {
 		on = false, silent = false, wallbang = false, hitbox = false, autoFire = false,
@@ -414,6 +415,8 @@ local function main()
 		silentColorR = 255, silentColorG = 180, silentColorB = 60,
 	}
 	local Rapid = { on = false, rate = .05, acc = 0, aimFire = false }
+	local FlingAll = { on = false, power = 1e9 }
+	local WalkFling = { on = false, power = 1e9 }
 	local Hooks = { on = false, orig = nil }
 	local fovCircle = nil
 	local silentCircle = nil
@@ -587,14 +590,58 @@ local function main()
 				task.spawn(pressFire)
 			end
 		end
+
+		if FlingAll.on then
+			local _, root = charPart()
+			if root then
+				local vel = root.AssemblyLinearVelocity
+				root.AssemblyLinearVelocity = Vector3.new(
+					math.random(-1, 1) * FlingAll.power,
+					FlingAll.power,
+					math.random(-1, 1) * FlingAll.power
+				)
+				RunService.RenderStepped:Wait()
+				root.AssemblyLinearVelocity = vel
+			end
+		end
+
+		if WalkFling.on then
+			local _, root = charPart()
+			if root then
+				for _, p in ipairs(Players:GetPlayers()) do
+					if p ~= PLR then
+						local ch, _, hrp = bodyOf(p)
+						if hrp and (hrp.Position - root.Position).Magnitude < 8 then
+							local vel = hrp.AssemblyLinearVelocity
+							hrp.AssemblyLinearVelocity = Vector3.new(
+								math.random(-1, 1) * WalkFling.power,
+								WalkFling.power,
+								math.random(-1, 1) * WalkFling.power
+							)
+						end
+					end
+				end
+			end
+		end
+
+		if State.spectating then
+			local targetPlr = Players:FindFirstChild(State.spectating)
+			local ch = targetPlr and targetPlr.Character
+			local head = ch and ch:FindFirstChild("Head")
+			if head then
+				CAM.CameraSubject = head
+			else
+				CAM.CameraSubject = PLR.Character and PLR.Character:FindFirstChildOfClass("Humanoid")
+			end
+		end
 	end
 
 	local function ensureCombat()
-		if Aim.on or Rapid.on then
+		if Aim.on or Rapid.on or FlingAll.on or WalkFling.on or State.spectating then
 			if not State.conns.combat then
 				State.conns.combat = hook(RunService.RenderStepped, combatTick)
 			end
-		elseif State.conns.combat then
+		elseif State.conns.combat and not (Aim.on or Rapid.on or FlingAll.on or WalkFling.on or State.spectating) then
 			State.conns.combat:Disconnect()
 			State.conns.combat = nil
 			Aim.target, Aim.headPos = nil, nil
@@ -644,7 +691,7 @@ local function main()
 	end
 
 	--==========================================================
-	-- 6. movement / visuals / teleport
+	-- 6. movement / visuals / teleport / spectate
 	--==========================================================
 	function Features.esp(on)
 		State.esp = on
@@ -830,6 +877,18 @@ local function main()
 		local ch = t and t.Character
 		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
 		if hrp then Features.teleport(hrp.CFrame) end
+	end
+
+	function Features.spectatePlayer(name)
+		if name == "" or name == State.spectating then
+			State.spectating = nil
+			CAM.CameraSubject = PLR.Character and PLR.Character:FindFirstChildOfClass("Humanoid")
+			notify("spectate off")
+		else
+			State.spectating = name
+			notify("spectating " .. name)
+		end
+		ensureCombat()
 	end
 
 	local function persistWaypoints()
@@ -1085,13 +1144,23 @@ local function main()
 	slider(cAim, "Max distance", 100, 5000, 1200, function(v) Aim.maxDist = v end)
 
 	local cFire = card(pCombat)
-	header(cFire, "fire")
+	header(cFire, "fire & exploit")
 	toggle(cFire, "Rapid fire", false, function(v)
 		Rapid.on = v
 		ensureCombat()
 	end, "spams tool:Activate / mouse1")
 	slider(cFire, "Fire interval (s)", .01, .5, .05, function(v) Rapid.rate = v end)
 	toggle(cFire, "Hitbox expander", false, Features.hitbox, "9x9 local hitbox")
+	toggle(cFire, "Fling All (1e9 power)", false, function(v)
+		FlingAll.on = v
+		ensureCombat()
+		notify("fling all " .. (v and "on" or "off"))
+	end, "applies 1e9 velocity loop")
+	toggle(cFire, "WalkFling (1e9 touch)", false, function(v)
+		WalkFling.on = v
+		ensureCombat()
+		notify("walkfling " .. (v and "on" or "off"))
+	end, "flings players when walking close")
 
 	local cAimState = card(pCombat, 40)
 	header(cAimState, "target")
@@ -1182,7 +1251,7 @@ local function main()
 	end
 
 	local cPlr = card(pTp)
-	header(cPlr, "players")
+	header(cPlr, "players (click to tp / spectate)")
 	local plrList = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = cPlr })
 	new("UIListLayout", { Padding = UDim.new(0, 4) }, plrList)
 
@@ -1196,12 +1265,21 @@ local function main()
 				local hum = ch and ch:FindFirstChildOfClass("Humanoid")
 				local r = new("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, Parent = plrList })
 				local go = new("TextButton", {
-					Size = UDim2.new(1, -52, 1, 0), BackgroundColor3 = C.panel, BorderSizePixel = 0,
+					Size = UDim2.new(1, -98, 1, 0), BackgroundColor3 = C.panel, BorderSizePixel = 0,
 					Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
 					TextColor3 = C.text, Text = "  " .. p.Name, Parent = r,
 				})
 				corner(go, 5)
 				go.MouseButton1Click:Connect(function() Features.teleportPlayer(p.Name) end)
+				
+				local spec = new("TextButton", {
+					Size = UDim2.fromOffset(44, 24), Position = UDim2.new(1, -94, 0, 0), BackgroundColor3 = C.off,
+					BorderSizePixel = 0, Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = C.text,
+					Text = "spec", Parent = r,
+				})
+				corner(spec, 5)
+				spec.MouseButton1Click:Connect(function() Features.spectatePlayer(p.Name) end)
+
 				new("TextLabel", {
 					Size = UDim2.fromOffset(46, 24), Position = UDim2.new(1, -46, 0, 0), BackgroundColor3 = C.card,
 					BorderSizePixel = 0, Font = Enum.Font.Code, TextSize = 10, TextColor3 = C.on,
@@ -1532,6 +1610,7 @@ local function main()
 		spamFolder:Destroy()
 		if EX.fps then pcall(EX.fps, 60) end
 		CAM.FieldOfView = State.baseFov
+		CAM.CameraSubject = PLR.Character and PLR.Character:FindFirstChildOfClass("Humanoid")
 		local _, _, hum = charPart()
 		if hum then
 			hum.WalkSpeed = State.baseSpeed
