@@ -564,9 +564,16 @@ local function main()
 		end
 	end
 
+	local acquireAcc = 0
 	local function combatTick(dt)
 		if Aim.on then
-			Aim.target, Aim.headPos = acquire()
+			-- throttle acquire à 30hz max pour éviter les freezes
+			acquireAcc += dt
+			if acquireAcc >= 0.033 then
+				acquireAcc = 0
+				local ok, t, h = pcall(acquire)
+				if ok then Aim.target, Aim.headPos = t, h end
+			end
 			updateCircle()
 			if Aim.target and Aim.headPos and not Aim.silent then
 				local goal = CFrame.lookAt(CAM.CFrame.Position, Aim.headPos)
@@ -578,7 +585,7 @@ local function main()
 			Rapid.acc += dt
 			if Rapid.acc >= Rapid.rate then
 				Rapid.acc = 0
-				pressFire()
+				task.spawn(pressFire)
 			end
 		end
 	end
@@ -965,9 +972,9 @@ local function main()
 		local conn = workspace.DescendantAdded:Connect(function(d)
 			if d:IsA("BasePart") and not isOurs(d) then hits += 1 end
 		end)
-		fire(cand, targetCF(Flood.target))
-		task.wait(.3)
-		conn:Disconnect()
+		pcall(fire, cand, targetCF(Flood.target))
+		task.wait(.25)
+		pcall(function() conn:Disconnect() end)
 		return hits
 	end
 
@@ -1463,33 +1470,39 @@ local function main()
 	end
 
 	task.spawn(function()
-		local fps, acc, frames = 0, 0, 0
+		local fps, acc, frames, uiAcc = 0, 0, 0, 0
 		while not State.killed and Gui.Parent do
 			local dt = RunService.RenderStepped:Wait()
 			frames += 1
 			acc += dt
+			uiAcc += dt
 			if acc >= .5 then
 				fps = math.floor(frames / acc)
 				acc, frames = 0, 0
 			end
-			local status = footer:FindFirstChild("status")
-			if status then
-				local ping = try(function()
-					return math.floor(game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue())
-				end)
-				status.Text = ("%d fps · %s ms · combat %s · flood %s"):format(
-					fps, ping and tostring(ping) or "-",
-					Aim.on and (Aim.silent and "silent" or "aimbot") or "off",
-					Flood.running and "run" or "idle")
-			end
-			aimLbl.Text = Aim.target and (Aim.target.Name .. " · " .. math.floor(Aim.fov) .. "px") or "none"
-			floodLbl.TextColor3 = Flood.running and C.on or C.dim
-			if Flood.running then
-				floodLbl.Text = ("RUN %d fires · %d/%d parts"):format(Flood.fires, Flood.created, Flood.budget)
-			else
-				floodLbl.Text = ("idle · %s · %s"):format(
-					Flood.selected and Flood.selected.obj.Name or "no remote", Flood.variant)
-			end
+			-- mise à jour UI limitée à 10hz pour éviter les freezes
+			if uiAcc < 0.1 then continue end
+			uiAcc = 0
+			pcall(function()
+				local status = footer:FindFirstChild("status")
+				if status then
+					local ping = try(function()
+						return math.floor(game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue())
+					end)
+					status.Text = ("%d fps · %s ms · combat %s · flood %s"):format(
+						fps, ping and tostring(ping) or "-",
+						Aim.on and (Aim.silent and "silent" or "aimbot") or "off",
+						Flood.running and "run" or "idle")
+				end
+				aimLbl.Text = Aim.target and (Aim.target.Name .. " · " .. math.floor(Aim.fov) .. "px") or "none"
+				floodLbl.TextColor3 = Flood.running and C.on or C.dim
+				if Flood.running then
+					floodLbl.Text = ("RUN %d fires · %d/%d parts"):format(Flood.fires, Flood.created, Flood.budget)
+				else
+					floodLbl.Text = ("idle · %s · %s"):format(
+						Flood.selected and Flood.selected.obj.Name or "no remote", Flood.variant)
+				end
+			end)
 		end
 	end)
 
