@@ -31,7 +31,7 @@ local function main()
 	-- 1. executor abstraction
 	--==========================================================
 	local EX = {
-		hook  = try(hookmetamethod),
+		hook  = try(hookmetamethod) or (typeof(hookmetamethod) == "function" and hookmetamethod or nil),
 		rawmt = try(getrawmetatable),
 		input = try(mouse1click),
 		clip  = try(setclipboard),
@@ -409,6 +409,9 @@ local function main()
 		fov = 260, silentFov = 260, smooth = .35, maxDist = 1200, ignoreTeam = true, wallCheck = true,
 		target = nil, headPos = nil,
 		silentOffsetX = 0, silentOffsetY = 0, draggingCircle = false,
+		showFov = true,
+		fovColorR = 124, fovColorG = 152, fovColorB = 255,
+		silentColorR = 255, silentColorG = 180, silentColorB = 60,
 	}
 	local Rapid = { on = false, rate = .05, acc = 0, aimFire = false }
 	local Hooks = { on = false, orig = nil }
@@ -533,55 +536,31 @@ local function main()
 		end)
 	end
 
-	-- 4 lignes pour le carré FOV silent aim
-	local silentSquare = {}
-	if EX.draw then
-		for i = 1, 4 do
-			local l = try(function() return Drawing.new("Line") end)
-			if l then
-				l.Thickness = 1.5
-				l.Transparency = .8
-				l.Color = Color3.fromRGB(255, 180, 60)
-				l.Visible = false
-				silentSquare[i] = l
-			end
-		end
-	end
+	local silentCircle = nil
 
 	local function updateCircle()
 		if not EX.draw then return end
 		local vp = CAM.ViewportSize
 		local center = Vector2.new(vp.X * .5, vp.Y * .5)
 
-		-- cercle aimbot (toujours centré sur offset)
+		-- cercle aimbot normal
 		if fovCircle then
-			fovCircle.Visible = Aim.on
-			if Aim.on then
+			fovCircle.Visible = Aim.on and Aim.showFov and not Aim.silent
+			if Aim.on and Aim.showFov and not Aim.silent then
 				fovCircle.Position = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
-				fovCircle.Radius = Aim.silent and Aim.silentFov or Aim.fov
-				fovCircle.Color = Aim.target and C.on or (Aim.silent and Color3.fromRGB(255,180,60) or C.accent)
+				fovCircle.Radius = Aim.fov
+				fovCircle.Color = Aim.target and C.on or Color3.fromRGB(Aim.fovColorR, Aim.fovColorG, Aim.fovColorB)
 			end
 		end
 
-		-- carré FOV silent aim
-		local showSquare = Aim.on and Aim.silent and #silentSquare == 4
-		if showSquare then
-			local cx = center.X + Aim.silentOffsetX
-			local cy = center.Y + Aim.silentOffsetY
-			local r = Aim.silentFov
-			local tl = Vector2.new(cx - r, cy - r)
-			local tr = Vector2.new(cx + r, cy - r)
-			local br = Vector2.new(cx + r, cy + r)
-			local bl = Vector2.new(cx - r, cy + r)
-			local corners = { {tl,tr},{tr,br},{br,bl},{bl,tl} }
-			for i, pair in ipairs(corners) do
-				silentSquare[i].From = pair[1]
-				silentSquare[i].To   = pair[2]
-				silentSquare[i].Visible = true
-				silentSquare[i].Color = Aim.target and C.on or Color3.fromRGB(255,180,60)
+		-- cercle silent aim
+		if silentCircle then
+			silentCircle.Visible = Aim.on and Aim.showFov and Aim.silent
+			if Aim.on and Aim.showFov and Aim.silent then
+				silentCircle.Position = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
+				silentCircle.Radius = Aim.silentFov
+				silentCircle.Color = Aim.target and C.on or Color3.fromRGB(Aim.silentColorR, Aim.silentColorG, Aim.silentColorB)
 			end
-		else
-			for _, l in ipairs(silentSquare) do l.Visible = false end
 		end
 	end
 
@@ -1080,10 +1059,22 @@ local function main()
 	end)
 	toggle(cAim, "Ignore teammates", true, function(v) Aim.ignoreTeam = v end)
 	toggle(cAim, "Wall check", true, function(v) Aim.wallCheck = v end)
+	toggle(cAim, "Show FOV circle", true, function(v)
+		Aim.showFov = v
+		updateCircle()
+	end)
 	slider(cAim, "FOV radius (px)", 40, 800, 260, function(v) Aim.fov = v end)
 	slider(cAim, "Silent FOV radius (px)", 40, 800, 260, function(v) Aim.silentFov = v end)
 	slider(cAim, "Silent FOV offset X", -600, 600, 0, function(v) Aim.silentOffsetX = v end)
 	slider(cAim, "Silent FOV offset Y", -400, 400, 0, function(v) Aim.silentOffsetY = v end)
+	local cFovColor = card(pCombat)
+	header(cFovColor, "fov colors")
+	slider(cFovColor, "FOV R", 0, 255, 124, function(v) Aim.fovColorR = v end)
+	slider(cFovColor, "FOV G", 0, 255, 152, function(v) Aim.fovColorG = v end)
+	slider(cFovColor, "FOV B", 0, 255, 255, function(v) Aim.fovColorB = v end)
+	slider(cFovColor, "Silent R", 0, 255, 255, function(v) Aim.silentColorR = v end)
+	slider(cFovColor, "Silent G", 0, 255, 180, function(v) Aim.silentColorG = v end)
+	slider(cFovColor, "Silent B", 0, 255, 60,  function(v) Aim.silentColorB = v end)
 	slider(cAim, "Smoothness", 0, 1, .35, function(v) Aim.smooth = v end)
 	slider(cAim, "Max distance", 100, 5000, 1200, function(v) Aim.maxDist = v end)
 
@@ -1512,8 +1503,7 @@ local function main()
 			pcall(function() fovCircle:Remove() end)
 			fovCircle = nil
 		end
-		for _, l in ipairs(silentSquare) do pcall(function() l:Remove() end) end
-		silentSquare = {}
+		if silentCircle then pcall(function() silentCircle:Remove() end) silentCircle = nil end
 		for p, set in pairs(ESP) do
 			for _, o in pairs(set) do pcall(function() o:Destroy() end) end
 			ESP[p] = nil
@@ -1567,6 +1557,7 @@ local function main()
 			silentCircle.Visible = false
 		end
 	end
+
 
 	-- drag du cercle FOV (aimbot + silent) avec clic droit maintenu sur le cercle
 	do
