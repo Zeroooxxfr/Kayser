@@ -1,4 +1,4 @@
---!nolint
+-- !nolint
 --[[ =============================================================
   KAYSER 2.1  |  full-stack executor suite (single file, Luau)
   RIGHT SHIFT = toggle UI     END = unload + restore world
