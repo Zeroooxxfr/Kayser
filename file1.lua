@@ -15,6 +15,9 @@ local function main()
 	local StarterGui          = game:GetService("StarterGui")
 	local HttpService         = game:GetService("HttpService")
 	local VirtualInputManager = game:GetService("VirtualInputManager")
+	local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+	local ReplicatedFirst     = game:GetService("ReplicatedFirst")
+	local ScriptContext       = game:GetService("ScriptContext")
 
 	local player = Players.LocalPlayer
 	local CAM = workspace.CurrentCamera
@@ -57,6 +60,143 @@ local function main()
 	local function hook(signal, fn) return signal:Connect(fn) end
 
 	--==========================================================
+	-- 1.5 anti-cheat bypass layer
+	--==========================================================
+	local Bypass = {
+		enabled = true,
+		savedprops = {},
+		hooked = false,
+		detections_blocked = 0,
+		conns = {},
+	}
+
+	local function spoof_humanoid(hum)
+		if not hum or not hum:IsA("Humanoid") then return end
+		if Bypass.savedprops[hum] then return end
+		Bypass.savedprops[hum] = {
+			WalkSpeed = hum.WalkSpeed,
+			JumpPower = hum.JumpPower,
+			HipHeight = hum.HipHeight,
+		}
+	end
+
+	local function restore_humanoid(hum)
+		local saved = Bypass.savedprops[hum]
+		if not saved then return end
+		pcall(function()
+			hum.WalkSpeed = saved.WalkSpeed
+			hum.JumpPower = saved.JumpPower
+			hum.HipHeight = saved.HipHeight
+		end)
+		Bypass.savedprops[hum] = nil
+	end
+
+	if EX.hook and EX.rawmt then
+		local ok, mt = pcall(EX.rawmt, game)
+		if ok and mt then
+			local old_index
+			old_index = EX.hook(mt, "__index", function(self, key)
+				if Bypass.enabled and typeof(self) == "Instance" then
+					if self:IsA("Humanoid") then
+						if key == "WalkSpeed" or key == "JumpPower" then
+							Bypass.detections_blocked += 1
+							local saved = Bypass.savedprops[self]
+							if saved then return saved[key] or 16 end
+							return 16
+						end
+					end
+				end
+				return old_index(self, key)
+			end)
+			Bypass.hooked = true
+		end
+	end
+
+	local AC_PATTERNS = { "iac-respond", "anticheat", "ac-", "detect", "ban", "kick", "report", "violation" }
+
+	local function name_matches_ac(name)
+		local n = name:lower()
+		for _, pat in ipairs(AC_PATTERNS) do
+			if n:find(pat, 1, true) then return true end
+		end
+		return false
+	end
+
+	local function kill_ac_remotes()
+		local function scan(parent)
+			for _, child in ipairs(parent:GetDescendants()) do
+				if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+					if name_matches_ac(child.Name) then
+						pcall(function() child:Destroy() end)
+					end
+				end
+			end
+		end
+		pcall(scan, ReplicatedStorage)
+		pcall(scan, ReplicatedFirst)
+		table.insert(Bypass.conns, ReplicatedStorage.ChildAdded:Connect(function(child)
+			if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+				if name_matches_ac(child.Name) then
+					task.defer(function() pcall(function() child:Destroy() end) end)
+				end
+			end
+		end))
+	end
+
+	local function kill_ac_threads()
+		local ok, gc = pcall(function() return getgc(true) end)
+		if ok and type(gc) == "table" then
+			for _, obj in ipairs(gc) do
+				if type(obj) == "table" then
+					for k, v in pairs(obj) do
+						if type(k) == "string" then
+							local lk = k:lower()
+							if (lk:find("detect") or lk:find("ban") or lk:find("kick")) and type(v) == "function" then
+								pcall(function() obj[k] = function() end end)
+								Bypass.detections_blocked += 1
+							end
+						end
+					end
+				end
+			end
+		end
+		local okc, conns = pcall(function() return getconnections(ScriptContext.Error) end)
+		if okc and type(conns) == "table" then
+			for _, c in ipairs(conns) do
+				pcall(function() c:Disable() end)
+			end
+		end
+	end
+
+	local function sanitize_character(char)
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			spoof_humanoid(hum)
+			table.insert(Bypass.conns, hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+				if Bypass.enabled then
+					local saved = Bypass.savedprops[hum]
+					if saved then saved.WalkSpeed = hum.WalkSpeed end
+				end
+			end))
+		end
+	end
+
+	if player.Character then sanitize_character(player.Character) end
+	table.insert(Bypass.conns, player.CharacterAdded:Connect(sanitize_character))
+
+	kill_ac_remotes()
+	task.defer(kill_ac_threads)
+
+	task.spawn(function()
+		while Bypass.enabled do
+			task.wait(5)
+			kill_ac_threads()
+		end
+	end)
+
+	ENV.__KAYSER_BYPASS = Bypass
+
+	--==========================================================
 	-- 2. state & config
 	--==========================================================
 	local State = {
@@ -71,7 +211,7 @@ local function main()
 		Fly = { Enabled = false },
 		WalkFling = {
 			Enabled = false,
-			Power = 9e7, -- standard safe power (infinite power removed)
+			Power = 9e7,
 			Spin = true,
 			TriggerRange = 10,
 			OnlyNearPlayers = true,
@@ -433,7 +573,6 @@ local function main()
 	local Rapid = { on = false, rate = 0.01, acc = 0, aimFire = false }
 	local SkidFlingAll = { on = false }
 
-	-- Walkfling state (Safe finite power)
 	local flingVel = Vector3.zero
 	local flingAng = Vector3.zero
 	local flingActive = false
@@ -525,7 +664,6 @@ local function main()
 		end
 	end)
 
-	-- Car Fling & Vehicle Speed Engine
 	RunService.Heartbeat:Connect(function()
 		local cfCfg = Config.CarFling
 		if not cfCfg.Enabled then return end
@@ -533,7 +671,6 @@ local function main()
 		local char = player.Character
 		local seat = char and char:FindFirstChildOfClass("Humanoid") and char.Humanoid.SeatPart
 		if not seat then
-			-- Also check workspace vehicles if seated elsewhere
 			for _, v in ipairs(workspace:GetDescendants()) do
 				if v:IsA("VehicleSeat") and v.Occupant and v.Occupant.Parent == char then
 					seat = v
@@ -832,7 +969,7 @@ local function main()
 			Rapid.acc += dt
 			if Rapid.acc >= Rapid.rate then
 				Rapid.acc = 0
-				task.spawn(trigger
+				task.spawn(triggerRapidFire)
 			end
 		end
 
@@ -1181,7 +1318,7 @@ local function main()
 
 	local function pool()
 		local out = {}
-		for _, root in ipairs({ game:GetService("ReplicatedStorage"), game:GetService("ReplicatedFirst") }) do
+		for _, root in ipairs({ ReplicatedStorage, ReplicatedFirst }) do
 			for _, d in ipairs(root:GetDescendants()) do
 				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
 					out[#out + 1] = { obj = d, score = scoreName(d.Name) }
@@ -1388,7 +1525,6 @@ local function main()
 	slider(cFire, "WalkFling Power", 1e6, 5e8, 9e7, function(v) Config.WalkFling.Power = v end)
 	toggle(cFire, "WalkFling Spin", true, function(v) Config.WalkFling.Spin = v end)
 
-	-- Car Fling & Speed Toggles / Sliders
 	toggle(cFire, "Car Fling", false, function(v)
 		Config.CarFling.Enabled = v
 		ensureCombat()
@@ -1506,7 +1642,7 @@ local function main()
 				})
 				corner(go, 5)
 				go.MouseButton1Click:Connect(function() Features.teleportPlayer(p.Name) end)
-				
+
 				local spec = new("TextButton", {
 					Size = UDim2.fromOffset(44, 24), Position = UDim2.new(1, -94, 0, 0), BackgroundColor3 = C.off,
 					BorderSizePixel = 0, Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = C.text,
@@ -1620,8 +1756,7 @@ local function main()
 				end)
 			end
 		end
-		if #Flood.cands == 0 then label(list, "
-		end)
+		if #Flood.cands == 0 then label(list, "no candidates") end
 	end
 
 	local cManual = card(pFlood)
@@ -1800,10 +1935,11 @@ local function main()
 					local ping = try(function()
 						return math.floor(game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue())
 					end)
-					status.Text = ("%d fps · %s ms · combat %s · flood %s"):format(
+					status.Text = ("%d fps · %s ms · combat %s · flood %s · ac+%d"):format(
 						fps, ping and tostring(ping) or "-",
 						Aim.on and (Aim.silent and "silent" or "aimbot") or "off",
-						Flood.running and "run" or "idle")
+						Flood.running and "run" or "idle",
+						Bypass.detections_blocked)
 				end
 				aimLbl.Text = Aim.target and (Aim.target.Name .. " · " .. math.floor(Aim.silent and Aim.silentFov or Aim.fov) .. "px") or "none"
 				floodLbl.TextColor3 = Flood.running and C.on or C.dim
@@ -1820,6 +1956,10 @@ local function main()
 	ENV.__KAYSER_UNLOAD = function()
 		if State.killed then return end
 		State.killed = true
+		Bypass.enabled = false
+		for _, c in pairs(Bypass.conns) do pcall(function() c:Disconnect() end) end
+		Bypass.conns = {}
+		for hum, _ in pairs(Bypass.savedprops) do restore_humanoid(hum) end
 		for _, c in pairs(State.conns) do pcall(function() c:Disconnect() end) end
 		State.conns = {}
 		removeHooks()
@@ -1857,6 +1997,7 @@ local function main()
 		Gui:Destroy()
 		ENV.__KAYSER_LOADED = nil
 		ENV.__KAYSER_UNLOAD = nil
+		ENV.__KAYSER_BYPASS = nil
 		notify("unloaded", 2)
 	end
 	ENV.__KAYSER_LOADED = true
