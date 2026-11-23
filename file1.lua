@@ -32,6 +32,7 @@ local function main()
 	--==========================================================
 	local EX = {
 		hook  = (function() local ok, v = pcall(function() return hookmetamethod end) return ok and type(v) == "function" and v or nil end)(),
+		namecall = (function() local ok, v = pcall(function() return getnamecallmethod end) return ok and type(v) == "function" and v or nil end)(),
 		rawmt = try(getrawmetatable),
 		input = try(mouse1click),
 		clip  = try(setclipboard),
@@ -70,13 +71,18 @@ local function main()
 		Fly = { Enabled = false },
 		WalkFling = {
 			Enabled = false,
-			Power = 9e7,
+			Power = 9e7, -- standard safe power (infinite power removed)
 			Spin = true,
 			TriggerRange = 10,
 			OnlyNearPlayers = true,
 			HeavyBody = true,
 			SafeReturn = false,
 			SafeReturnDistance = 50,
+		},
+		CarFling = {
+			Enabled = false,
+			Power = 9e7,
+			Speed = 100,
 		}
 	}
 
@@ -412,21 +418,22 @@ local function main()
 	end
 
 	--==========================================================
-	-- 5. combat engine, walkfling implementation & anti-freeze
+	-- 5. advanced combat engine & car/walk fling
 	--==========================================================
 	local Aim = {
 		on = false, silent = false, wallbang = false, hitbox = false, autoFire = false,
 		fov = 260, silentFov = 260, smooth = .35, maxDist = 1200, ignoreTeam = true, wallCheck = true,
 		target = nil, headPos = nil,
-		silentOffsetX = 0, silentOffsetY = 0, draggingCircle = false,
+		silentOffsetX = 0, silentOffsetY = 0,
 		showFov = true,
 		fovColorR = 124, fovColorG = 152, fovColorB = 255,
 		silentColorR = 255, silentColorG = 180, silentColorB = 60,
 	}
-	local Rapid = { on = false, rate = .05, acc = 0, aimFire = false }
+
+	local Rapid = { on = false, rate = 0.01, acc = 0, aimFire = false }
 	local SkidFlingAll = { on = false }
 
-	-- Walkfling State & Logic requested by user (anti-fling removed)
+	-- Walkfling state (Safe finite power)
 	local flingVel = Vector3.zero
 	local flingAng = Vector3.zero
 	local flingActive = false
@@ -518,6 +525,37 @@ local function main()
 		end
 	end)
 
+	-- Car Fling & Vehicle Speed Engine
+	RunService.Heartbeat:Connect(function()
+		local cfCfg = Config.CarFling
+		if not cfCfg.Enabled then return end
+
+		local char = player.Character
+		local seat = char and char:FindFirstChildOfClass("Humanoid") and char.Humanoid.SeatPart
+		if not seat then
+			-- Also check workspace vehicles if seated elsewhere
+			for _, v in ipairs(workspace:GetDescendants()) do
+				if v:IsA("VehicleSeat") and v.Occupant and v.Occupant.Parent == char then
+					seat = v
+					break
+				end
+			end
+		end
+
+		if seat and seat.Parent then
+			local vehicleModel = seat.Parent
+			if not vehicleModel:IsA("Model") then vehicleModel = vehicleModel.Parent end
+			if vehicleModel and vehicleModel:IsA("Model") then
+				for _, part in ipairs(vehicleModel:GetDescendants()) do
+					if part:IsA("BasePart") then
+						part.AssemblyLinearVelocity = part.CFrame.LookVector * cfCfg.Speed + Vector3.new(0, cfCfg.Power * 0.001, 0)
+						part.AssemblyAngularVelocity = Vector3.new(0, cfCfg.Power * 0.001, 0)
+					end
+				end
+			end
+		end
+	end)
+
 	RunService.RenderStepped:Connect(function()
 		if not flingActive then return end
 		local _, _, root = getChar()
@@ -537,7 +575,7 @@ local function main()
 		end
 	end)
 
-	local Hooks = { on = false, orig = nil }
+	local Hooks = { on = false, origIndex = nil }
 	local fovCircle = nil
 	local silentCircle = nil
 
@@ -578,29 +616,38 @@ local function main()
 	end
 
 	local function installHooks()
-		if Hooks.on or not (EX.hook and EX.rawmt) then return false end
-		local ok, orig = pcall(EX.hook, game, "__index", function(self, key)
-			if self == mouse and Aim.silent and Aim.headPos then
-				if key == "Hit" then return CFrame.new(Aim.headPos) end
-				if key == "Target" then return Aim.target and Aim.target.Character end
-				if key == "UnitRay" then
-					local o = CAM.CFrame.Position
-					return Ray.new(o, (Aim.headPos - o).Unit * 2000)
+		if Hooks.on or not EX.hook then return false end
+		local okIndex, origIndex = pcall(function()
+			return EX.hook(game, "__index", function(self, key)
+				if Aim.silent and Aim.headPos then
+					if self == mouse then
+						if key == "Hit" then return CFrame.new(Aim.headPos) end
+						if key == "Target" then return Aim.target and Aim.target.Character end
+						if key == "UnitRay" then
+							local o = CAM.CFrame.Position
+							return Ray.new(o, (Aim.headPos - o).Unit * 2000)
+						end
+					end
 				end
-			end
-			if self == workspace and key == "Raycast" and Aim.wallbang then
-				return wallbangRaycast
-			end
-			return orig(self, key)
+				if Aim.wallbang and self == workspace and key == "Raycast" then
+					return wallbangRaycast
+				end
+				return origIndex(self, key)
+			end)
 		end)
-		if not ok then return false end
-		Hooks.on, Hooks.orig = true, orig
-		return true
+		if okIndex then
+			Hooks.on = true
+			Hooks.origIndex = origIndex
+			return true
+		end
+		return false
 	end
 
 	local function removeHooks()
 		if not Hooks.on or not EX.hook then return end
-		pcall(EX.hook, game, "__index", Hooks.orig)
+		if Hooks.origIndex then
+			pcall(EX.hook, game, "__index", Hooks.origIndex)
+		end
 		Hooks.on = false
 	end
 
@@ -619,15 +666,10 @@ local function main()
 		local center = Vector2.new(vp.X * .5, vp.Y * .5)
 		local screenPos = Vector2.new(sp.X, sp.Y)
 		local activeCenter = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
-		if Aim.silent then
-			local d = (screenPos - activeCenter).Magnitude
-			if d > Aim.silentFov then return nil end
-			return d
-		else
-			local d = (screenPos - activeCenter).Magnitude
-			if d > Aim.fov then return nil end
-			return d
-		end
+		local radius = Aim.silent and Aim.silentFov or Aim.fov
+		local d = (screenPos - activeCenter).Magnitude
+		if d > radius then return nil end
+		return d
 	end
 
 	local function canSee(ch, pos)
@@ -660,17 +702,21 @@ local function main()
 		return best, bestPos
 	end
 
-	local function pressFire()
+	local function triggerRapidFire()
 		local ch = player.Character
-		local tool = ch and ch:FindFirstChildOfClass("Tool")
+		if not ch then return end
+		local tool = ch:FindFirstChildOfClass("Tool")
 		if tool then
-			pcall(function() tool:Activate() end)
-			return
+			pcall(function()
+				tool:Activate()
+				for _, descendant in ipairs(tool:GetDescendants()) do
+					if descendant:IsA("RemoteEvent") then
+						pcall(function() descendant:FireServer() end)
+					end
+				end
+			end)
 		end
-		if EX.input then
-			pcall(EX.input)
-			return
-		end
+		if EX.input then pcall(EX.input) end
 		pcall(function()
 			VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
 			VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
@@ -704,7 +750,6 @@ local function main()
 		end
 	end
 
-	-- Integrated SkidFling Routine (Targeted Fling)
 	local function ExecuteSkidFling(TargetPlayer)
 		if not TargetPlayer or not TargetPlayer.Parent then return false end
 		if IsPlayerSeated(TargetPlayer) then return false end
@@ -717,31 +762,14 @@ local function main()
 		local THumanoid = TCharacter and TCharacter:FindFirstChildOfClass("Humanoid")
 		local TRootPart = THumanoid and THumanoid.RootPart
 		local THead = TCharacter and TCharacter:FindFirstChild("Head")
-		local Accessory = TCharacter and TCharacter:FindFirstChildOfClass("Accessory")
-		local Handle = Accessory and Accessory:FindFirstChild("Handle")
 
 		if not (Character and Humanoid and RootPart) then return false end
 
 		local oldPos = RootPart.CFrame
-		if RootPart.Velocity.Magnitude < 50 then
-			oldPos = RootPart.CFrame
-		end
-
-		if THead then
-			workspace.CurrentCamera.CameraSubject = THead
-		elseif Handle then
-			workspace.CurrentCamera.CameraSubject = Handle
-		elseif THumanoid and TRootPart then
-			workspace.CurrentCamera.CameraSubject = THumanoid
-		end
-
-		if not TCharacter:FindFirstChildWhichIsA("BasePart") then return false end
+		if THead then workspace.CurrentCamera.CameraSubject = THead end
 
 		local function FPos(BasePart, Pos, Ang)
-			if not BasePart or not BasePart.Parent then return end
-			if not RootPart or not RootPart.Parent then return end
-			if not Character or not Character.Parent then return end
-
+			if not BasePart or not BasePart.Parent or not RootPart then return end
 			RootPart.CFrame = CFrame.new(BasePart.Position) * Pos * Ang
 			Character:SetPrimaryPartCFrame(CFrame.new(BasePart.Position) * Pos * Ang)
 			RootPart.Velocity = Vector3.new(9e7, 9e8, 9e7)
@@ -751,73 +779,31 @@ local function main()
 		local function SFBasePart(BasePart)
 			local Time = tick()
 			local Angle = 0
-
 			repeat
 				if RootPart and THumanoid then
-					if BasePart.Velocity.Magnitude < 50 then
-						Angle = Angle + 100
-						FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(2.25, 1.5, -2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(-2.25, -1.5, 2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
-					else
-						FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, -1.5, -THumanoid.WalkSpeed), CFrame.Angles(0, 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, 1.5, TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(math.rad(90), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, -1.5, -TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(0, 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, 1.5, TRootPart.Velocity.Magnitude/1.25), CFrame.Angles(math.rad(90), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(-90), 0, 0)); task.wait()
-						FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0)); task.wait()
-					end
+					Angle = Angle + 100
+					FPos(BasePart, CFrame.new(0, 1.5, 0), CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
+					FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(Angle), 0, 0)); task.wait()
 				else
 					break
 				end
-			until BasePart.Velocity.Magnitude > 500
-				or BasePart.Parent ~= TargetPlayer.Character
-				or TargetPlayer.Parent ~= Players
-				or THumanoid.Sit
-				or Humanoid.Health <= 0
-				or tick() > Time + 2
+			until BasePart.Velocity.Magnitude > 500 or BasePart.Parent ~= TargetPlayer.Character or tick() > Time + 1.5
 		end
 
 		local fpdh = workspace.FallenPartsDestroyHeight
 		workspace.FallenPartsDestroyHeight = 0/0
 		Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
 
-		if TRootPart and THead then
-			if (TRootPart.CFrame.p - THead.CFrame.p).Magnitude > 5 then
-				SFBasePart(THead)
-			else
-				SFBasePart(TRootPart)
-			end
-		elseif TRootPart and not THead then
-			SFBasePart(TRootPart)
-		elseif not TRootPart and THead then
-			SFBasePart(THead)
-		elseif Accessory and Handle then
-			SFBasePart(Handle)
-		end
+		if TRootPart then SFBasePart(TRootPart) elseif THead then SFBasePart(THead) end
 
 		Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
 		workspace.CurrentCamera.CameraSubject = Humanoid
 
 		repeat
-			if not RootPart or not RootPart.Parent then break end
-			if not Character or not Character.Parent then break end
-			RootPart.CFrame = oldPos * CFrame.new(0, .5, 0)
-			Character:SetPrimaryPartCFrame(oldPos * CFrame.new(0, .5, 0))
+			if not RootPart then break end
+			RootPart.CFrame = oldPos
+			Character:SetPrimaryPartCFrame(oldPos)
 			Humanoid:ChangeState("GettingUp")
-			for _, x in ipairs(Character:GetChildren()) do
-				if x:IsA("BasePart") then
-					x.Velocity = Vector3.new()
-					x.RotVelocity = Vector3.new()
-				end
-			end
 			task.wait()
 		until (RootPart.Position - oldPos.p).Magnitude < 25
 
@@ -840,12 +826,13 @@ local function main()
 				CAM.CFrame = Aim.smooth <= 0 and goal or CAM.CFrame:Lerp(goal, math.clamp(1 - Aim.smooth, .04, 1))
 			end
 		end
+
 		Rapid.aimFire = Aim.on and Aim.autoFire and Aim.target ~= nil
 		if Rapid.on or Rapid.aimFire then
 			Rapid.acc += dt
 			if Rapid.acc >= Rapid.rate then
 				Rapid.acc = 0
-				task.spawn(pressFire)
+				task.spawn(triggerRapidFire)
 			end
 		end
 
@@ -862,11 +849,11 @@ local function main()
 	end
 
 	local function ensureCombat()
-		if Aim.on or Rapid.on or SkidFlingAll.on or Config.WalkFling.Enabled or State.spectating then
+		if Aim.on or Rapid.on or SkidFlingAll.on or Config.WalkFling.Enabled or Config.CarFling.Enabled or State.spectating then
 			if not State.conns.combat then
 				State.conns.combat = hook(RunService.RenderStepped, combatTick)
 			end
-		elseif State.conns.combat and not (Aim.on or Rapid.on or SkidFlingAll.on or Config.WalkFling.Enabled or State.spectating) then
+		elseif State.conns.combat and not (Aim.on or Rapid.on or SkidFlingAll.on or Config.WalkFling.Enabled or Config.CarFling.Enabled or State.spectating) then
 			State.conns.combat:Disconnect()
 			State.conns.combat = nil
 			Aim.target, Aim.headPos = nil, nil
@@ -875,49 +862,18 @@ local function main()
 		if Aim.on or Aim.wallbang then installHooks() else removeHooks() end
 	end
 
-	-- Auto SkidFling Loop Thread
 	task.spawn(function()
 		while true do
 			if SkidFlingAll.on then
-				local targets = {}
-				for _, p in ipairs(Players:GetPlayers()) do
-					if p ~= player and not IsWhitelisted(p) then
-						table.insert(targets, p)
-					end
-				end
-
-				if #targets == 0 then
-					task.wait(1)
-				else
-					for _, target in ipairs(targets) do
+				for _, target in ipairs(Players:GetPlayers()) do
+					if target ~= player and not IsWhitelisted(target) then
 						if not SkidFlingAll.on then break end
-						if not target or not target.Parent then continue end
-						if IsWhitelisted(target) then continue end
-
-						local char = player.Character
-						local hum = char and char:FindFirstChildOfClass("Humanoid")
-						if not char or not char.Parent or not hum or hum.Health <= 0 then
-							repeat
-								task.wait(0.5)
-								char = player.Character
-								hum = char and char:FindFirstChildOfClass("Humanoid")
-							until char and char.Parent and hum and hum.Health > 0
-							task.wait(1)
+						if not IsPlayerSeated(target) then
+							pcall(function() ExecuteSkidFling(target) end)
 						end
-
-						if IsPlayerSeated(target) then
-							task.wait(0.2)
-							continue
-						end
-
-						pcall(function()
-							ExecuteSkidFling(target)
-						end)
-
-						task.wait(0.3)
 					end
-					task.wait(1)
 				end
+				task.wait(0.5)
 			else
 				task.wait(0.5)
 			end
@@ -950,11 +906,7 @@ local function main()
 			if on then makeHitbox(p) else dropHitbox(p) end
 		end
 		if on and not State.conns.hitRefresh then
-			local acc = 0
 			State.conns.hitRefresh = hook(RunService.Heartbeat, function(dt)
-				acc += dt
-				if acc < 1 then return end
-				acc = 0
 				for _, p in ipairs(Players:GetPlayers()) do makeHitbox(p) end
 			end)
 		elseif not on and State.conns.hitRefresh then
@@ -999,11 +951,7 @@ local function main()
 			if on then build(p) else clear(p) end
 		end
 		if on and not State.conns.espRefresh then
-			local acc = 0
 			State.conns.espRefresh = hook(RunService.Heartbeat, function(dt)
-				acc += dt
-				if acc < 1 then return end
-				acc = 0
 				local _, _, root = getChar()
 				for p, set in pairs(ESP) do
 					local ch = p.Character
@@ -1389,7 +1337,7 @@ local function main()
 		Aim.silent = v
 		if v and not EX.hook then notify("silent aim needs hookmetamethod") end
 		ensureCombat()
-	end, "hooks Mouse.Hit / UnitRay")
+	end, "hooks Mouse properties / Raycast namecalls")
 	toggle(cAim, "Wallbang", false, function(v)
 		Aim.wallbang = v
 		ensureCombat()
@@ -1421,25 +1369,33 @@ local function main()
 
 	local cFire = card(pCombat)
 	header(cFire, "fire & exploit")
-	toggle(cFire, "Rapid fire", false, function(v)
+	toggle(cFire, "Rapid fire (burst mode)", false, function(v)
 		Rapid.on = v
 		ensureCombat()
-	end, "spams tool:Activate / mouse1")
-	slider(cFire, "Fire interval (s)", .01, .5, .05, function(v) Rapid.rate = v end)
+	end, "bypasses tool cooldowns / instant burst fire")
+	slider(cFire, "Fire interval (s)", .001, .1, .01, function(v) Rapid.rate = v end)
 	toggle(cFire, "Hitbox expander", false, Features.hitbox, "9x9 local hitbox")
 	toggle(cFire, "SkidFling All", false, function(v)
 		SkidFlingAll.on = v
 		ensureCombat()
 		notify("skidfling all " .. (v and "on" or "off"))
-	end, "loops through all targets with SkidFling")
-	toggle(cFire, "WalkFling (Custom Loop)", false, function(v)
+	end, "loops through all targets")
+	toggle(cFire, "WalkFling (Safe Power)", false, function(v)
 		Config.WalkFling.Enabled = v
 		ensureCombat()
 		notify("walkfling " .. (v and "on" or "off"))
 	end, "custom pass-by fling loop")
-	slider(cFire, "WalkFling Range", 4, 30, 10, function(v) Config.WalkFling.TriggerRange = v end)
 	slider(cFire, "WalkFling Power", 1e6, 5e8, 9e7, function(v) Config.WalkFling.Power = v end)
 	toggle(cFire, "WalkFling Spin", true, function(v) Config.WalkFling.Spin = v end)
+
+	-- Car Fling & Speed Toggles / Sliders
+	toggle(cFire, "Car Fling", false, function(v)
+		Config.CarFling.Enabled = v
+		ensureCombat()
+		notify("car fling " .. (v and "on" or "off"))
+	end, "flings vehicles you drive")
+	slider(cFire, "Car Speed", 50, 1000, 100, function(v) Config.CarFling.Speed = v end)
+	slider(cFire, "Car Fling Power", 1e6, 5e8, 9e7, function(v) Config.CarFling.Power = v end)
 
 	local cAimState = card(pCombat, 40)
 	header(cAimState, "target")
@@ -1489,7 +1445,7 @@ local function main()
 	local cTp = card(pTp)
 	header(cTp, "position")
 	button(cTp, "Teleport to cursor", Features.teleportMouse)
-	local wpRow = row(cTp)
+	local wpRow = row(pTp)
 	local wpHost = new("Frame", { Size = UDim2.new(1, -70, 1, 0), BackgroundTransparency = 1, Parent = wpRow })
 	local wpBox = box(wpHost, "waypoint name", function(text)
 		Features.saveWaypoint(text)
