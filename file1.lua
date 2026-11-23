@@ -832,7 +832,7 @@ local function main()
 			Rapid.acc += dt
 			if Rapid.acc >= Rapid.rate then
 				Rapid.acc = 0
-				task.spawn(triggerRapidFire)
+				task.spawn(trigger
 			end
 		end
 
@@ -1082,7 +1082,7 @@ local function main()
 	end
 
 	function Features.teleport(cf)
-		local ch = getChar()
+		local _, _, ch = getChar()
 		if not ch or not cf then return end
 		pcall(function() ch:PivotTo(cf + Vector3.new(0, 3, 0)) end)
 	end
@@ -1620,9 +1620,9 @@ local function main()
 				end)
 			end
 		end
-		if #Flood.cands == 0 then label(list, "  press search") end
+		if #Flood.cands == 0 then label(list, "
+		end)
 	end
-	filterBox:GetPropertyChangedSignal("Text"):Connect(function() Flood.render() end)
 
 	local cManual = card(pFlood)
 	header(cManual, "manual")
@@ -1824,10 +1824,10 @@ local function main()
 		State.conns = {}
 		removeHooks()
 		if fovCircle then
-			pcall(function() fovCircle:Remove() end)
+			pcall(function() fovCircle:Destroy() end)
 			fovCircle = nil
 		end
-		if silentCircle then pcall(function() silentCircle:Remove() end) silentCircle = nil end
+		if silentCircle then pcall(function() silentCircle:Destroy() end) silentCircle = nil end
 		for p, set in pairs(ESP) do
 			for _, o in pairs(set) do pcall(function() o:Destroy() end) end
 			ESP[p] = nil
