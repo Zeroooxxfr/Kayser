@@ -1,6 +1,6 @@
 -- !nolint
 --[[ =============================================================
-  KAYSER 2.2  |  full-stack executor suite (single file, Luau)
+  KAYSER 2.3  |  full-stack executor suite (single file, Luau)
   RIGHT SHIFT = toggle UI     END = unload + restore world
 ============================================================= ]]
 
@@ -42,6 +42,7 @@ local function main()
 		fps   = try(setfpscap),
 		draw  = try(function() return typeof(Drawing) == "table" and Drawing or nil end),
 		hint  = try(identifyexecutor),
+		hookfn = try(function() return hookfunction end),
 	}
 
 	local Toast
@@ -1280,13 +1281,82 @@ local function main()
 	end
 
 	--==========================================================
-	-- 7. auto-flood engine
+	-- 1.6 unlimited mode
+	--==========================================================
+	local Unlimited = { on = false }
+
+	local LIMITS = {
+		flood = { rate = 450, budget = 5000, workers = 4, lag = 1 },
+		move = { speed = 500, jump = 500 },
+		aim = { fov = 260, maxDist = 1200, smooth = 0.35 },
+		rapid = { rate = 0.01 },
+	}
+
+	function Unlimited.enable()
+		Unlimited.on = true
+		Flood.rate = 20000
+		Flood.budget = 1e9
+		Flood.workers = 64
+		Flood.lag = 0
+		if Widgets.sliders["Rate per second"] then Widgets.sliders["Rate per second"].set(20000) end
+		if Widgets.sliders["Part budget"] then Widgets.sliders["Part budget"].set(1e9) end
+		if Widgets.sliders["Workers"] then Widgets.sliders["Workers"].set(64) end
+		if Widgets.sliders["Iteration delay (s)"] then Widgets.sliders["Iteration delay (s)"].set(0) end
+		if Widgets.sliders["+ WalkSpeed"] then Widgets.sliders["+ WalkSpeed"].set(5000) end
+		if Widgets.sliders["+ JumpPower"] then Widgets.sliders["+ JumpPower"].set(5000) end
+		State.addSpeed = 5000
+		State.addJump = 5000
+		Aim.fov = 5000
+		Aim.silentFov = 5000
+		Aim.maxDist = 100000
+		Aim.smooth = 0
+		if Widgets.sliders["FOV radius (px)"] then Widgets.sliders["FOV radius (px)"].set(5000) end
+		if Widgets.sliders["Silent FOV radius (px)"] then Widgets.sliders["Silent FOV radius (px)"].set(5000) end
+		if Widgets.sliders["Max distance"] then Widgets.sliders["Max distance"].set(100000) end
+		if Widgets.sliders["Smoothness"] then Widgets.sliders["Smoothness"].set(0) end
+		Rapid.rate = 0.0001
+		if Widgets.sliders["Fire interval (s)"] then Widgets.sliders["Fire interval (s)"].set(0.0001) end
+		applyMovement()
+		notify("limits retired", 3)
+	end
+
+	function Unlimited.disable()
+		Unlimited.on = false
+		Flood.rate = LIMITS.flood.rate
+		Flood.budget = LIMITS.flood.budget
+		Flood.workers = LIMITS.flood.workers
+		Flood.lag = LIMITS.flood.lag
+		if Widgets.sliders["Rate per second"] then Widgets.sliders["Rate per second"].set(LIMITS.flood.rate) end
+		if Widgets.sliders["Part budget"] then Widgets.sliders["Part budget"].set(LIMITS.flood.budget) end
+		if Widgets.sliders["Workers"] then Widgets.sliders["Workers"].set(LIMITS.flood.workers) end
+		if Widgets.sliders["Iteration delay (s)"] then Widgets.sliders["Iteration delay (s)"].set(LIMITS.flood.lag) end
+		if Widgets.sliders["+ WalkSpeed"] then Widgets.sliders["+ WalkSpeed"].set(0) end
+		if Widgets.sliders["+ JumpPower"] then Widgets.sliders["+ JumpPower"].set(0) end
+		State.addSpeed = 0
+		State.addJump = 0
+		Aim.fov = 260
+		Aim.silentFov = 260
+		Aim.maxDist = 1200
+		Aim.smooth = 0.35
+		if Widgets.sliders["FOV radius (px)"] then Widgets.sliders["FOV radius (px)"].set(260) end
+		if Widgets.sliders["Silent FOV radius (px)"] then Widgets.sliders["Silent FOV radius (px)"].set(260) end
+		if Widgets.sliders["Max distance"] then Widgets.sliders["Max distance"].set(1200) end
+		if Widgets.sliders["Smoothness"] then Widgets.sliders["Smoothness"].set(0.35) end
+		Rapid.rate = LIMITS.rapid.rate
+		if Widgets.sliders["Fire interval (s)"] then Widgets.sliders["Fire interval (s)"].set(LIMITS.rapid.rate) end
+		applyMovement()
+		notify("limits restored", 3)
+	end
+
+	--==========================================================
+	-- 7. flood engine v2 (probe + harvest + concurrent)
 	--==========================================================
 	local Flood = {
 		running = false, busy = false, created = 0, fires = 0, inflight = 0,
 		cands = {}, selected = nil, variant = "cframe", prefix = {},
 		budget = 5000, rate = 450, localMode = false, anchored = true,
-		conn = nil, target = "",
+		conn = nil, target = "", workers = 4, lag = 1,
+		templates = {},
 	}
 
 	local old = workspace:FindFirstChild("KayserSpam")
@@ -1317,10 +1387,11 @@ local function main()
 	end
 
 	local function pool()
-		local out = {}
+		local out, seen = {}, {}
 		for _, root in ipairs({ ReplicatedStorage, ReplicatedFirst }) do
 			for _, d in ipairs(root:GetDescendants()) do
-				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+				if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) and not seen[d] then
+					seen[d] = true
 					out[#out + 1] = { obj = d, score = scoreName(d.Name) }
 				end
 			end
@@ -1344,28 +1415,135 @@ local function main()
 		) * CFrame.Angles(math.random() * 6.28, math.random() * 6.28, math.random() * 6.28)
 	end
 
-	local function buildPayload(cf)
-		local v = Flood.variant
-		if v == "cframe" then return cf end
-		if v == "pos" then return cf.Position end
-		if v == "table_cf" then return { cframe = cf, CFrame = cf } end
-		if v == "cf_size" then return cf, Vector3.new(2, 2, 2) end
-		if v == "name_cf" then return "Part", cf end
-		if v == "double" then return cf, cf end
-		return { name = "Part", cframe = cf, size = Vector3.new(2, 2, 2), Color = Color3.new(1, 0, 0) }
+	local Harvest = { on = false, conns = {}, seen = {} }
+
+	local function shapeOf(v, depth)
+		depth = depth or 0
+		if depth > 3 then return "..." end
+		local t = typeof(v)
+		if t == "CFrame" then return "CFrame" end
+		if t == "Vector3" then return "Vector3" end
+		if t == "Vector2" then return "Vector2" end
+		if t == "Color3" then return "Color3" end
+		if t == "Instance" then return "Instance:" .. v.ClassName end
+		if t == "table" then
+			local parts = {}
+			for k, val in pairs(v) do
+				parts[#parts + 1] = tostring(k) .. "=" .. shapeOf(val, depth + 1)
+				if #parts >= 6 then break end
+			end
+			return "{" .. table.concat(parts, ",") .. "}"
+		end
+		if t == "string" then return "string(" .. #v .. ")" end
+		if t == "number" then return math.floor(v) == v and "int" or "float" end
+		return tostring(t)
 	end
 
-	local function fire(cand, cf)
-		local o = cand.obj
+	local function sigOf(args)
+		local parts = {}
+		for i = 1, #args do parts[i] = shapeOf(args[i]) end
+		return table.concat(parts, "|")
+	end
+
+	local function harvestRemote(re)
+		if Harvest.seen[re] then return end
+		Harvest.seen[re] = true
+		if not EX.hookfn then return end
+		local ok, orig = pcall(EX.hookfn, re.FireServer, function(self, ...)
+			local args = { ... }
+			local sig = sigOf(args)
+			local entry = Flood.templates[re]
+			if not entry then
+				entry = { sig = sig, count = 0, sample = args }
+				Flood.templates[re] = entry
+			elseif entry.sig == sig then
+				entry.count += 1
+			end
+			return orig(self, ...)
+		end)
+		if ok then table.insert(Harvest.conns, { re = re, orig = orig }) end
+	end
+
+	function Harvest.start(dur)
+		if Harvest.on or not EX.hookfn then return false end
+		Harvest.on = true
+		Flood.templates = {}
+		Harvest.seen = {}
+		for _, root in ipairs({ ReplicatedStorage, ReplicatedFirst }) do
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA("RemoteEvent") then harvestRemote(d) end
+			end
+		end
+		task.delay(dur or 15, Harvest.stop)
+		notify("harvesting remotes for " .. (dur or 15) .. "s", 4)
+		return true
+	end
+
+	function Harvest.stop()
+		if not Harvest.on then return end
+		Harvest.on = false
+		for _, h in ipairs(Harvest.conns) do
+			pcall(EX.hookfn, h.re.FireServer, h.orig)
+		end
+		Harvest.conns = {}
+		local n = 0
+		for _ in pairs(Flood.templates) do n += 1 end
+		notify(("harvest done · %d remotes captured"):format(n), 4)
+	end
+
+	local function argsFromTemplate(re, cf)
+		local t = Flood.templates[re]
+		if not t then return nil end
 		local args = {}
-		for i = 1, #Flood.prefix do args[#args + 1] = Flood.prefix[i] end
-		local p1, p2 = buildPayload(cf)
-		args[#args + 1] = p1
-		if p2 ~= nil then args[#args + 1] = p2 end
+		for i, v in ipairs(t.sample) do
+			local tv = typeof(v)
+			if tv == "CFrame" then args[i] = cf
+			elseif tv == "Vector3" then args[i] = cf.Position
+			elseif tv == "table" then
+				local copy = {}
+				for k, val in pairs(v) do
+					local tk = typeof(val)
+					if tk == "CFrame" then copy[k] = cf
+					elseif tk == "Vector3" then copy[k] = cf.Position
+					else copy[k] = val end
+				end
+				args[i] = copy
+			else args[i] = v end
+		end
+		return args
+	end
+
+	local function buildPayload(cf, shape)
+		local v = shape
+		if v == "cframe" then return { cf } end
+		if v == "pos" then return { cf.Position } end
+		if v == "table_cf" then return { { cframe = cf, CFrame = cf } } end
+		if v == "cf_size" then return { cf, Vector3.new(2, 2, 2) } end
+		if v == "name_cf" then return { "Part", cf } end
+		if v == "double" then return { cf, cf } end
+		if v == "int_pos" then return { 1, cf.Position } end
+		if v == "pos_int_cf" then return { cf.Position, 1, cf } end
+		if v == "lookvector" then return { cf.Position, cf.LookVector } end
+		return { { name = "Part", cframe = cf, size = Vector3.new(2, 2, 2), Color = Color3.new(1, 0, 0) } }
+	end
+
+	local function fire(cand, cf, shape)
+		local o = cand.obj
+		local args
+		local tpl = argsFromTemplate(o, cf)
+		if tpl then
+			args = tpl
+			for i = 1, #Flood.prefix do table.insert(args, i, Flood.prefix[i]) end
+		else
+			args = {}
+			for i = 1, #Flood.prefix do args[#args + 1] = Flood.prefix[i] end
+			local payload = buildPayload(cf, shape)
+			for _, v in ipairs(payload) do args[#args + 1] = v end
+		end
 		if o:IsA("RemoteEvent") then
 			pcall(o.FireServer, o, table.unpack(args))
 		else
-			if Flood.inflight > 40 then return end
+			if Flood.inflight > 60 then return end
 			Flood.inflight += 1
 			task.spawn(function()
 				pcall(o.InvokeServer, o, table.unpack(args))
@@ -1385,20 +1563,29 @@ local function main()
 		notify(("stopped [%s] · %d fires · %d parts"):format(reason or "manual", Flood.fires, Flood.created), 4)
 	end
 
+	local SHAPES = {
+		"template", "cframe", "pos", "table_cf", "cf_size", "name_cf",
+		"table_full", "double", "int_pos", "pos_int_cf", "lookvector",
+	}
+
 	local function tryShape(cand, shape)
-		Flood.variant = shape
 		local hits = 0
 		local conn = workspace.DescendantAdded:Connect(function(d)
 			if d:IsA("BasePart") and not isOurs(d) then hits += 1 end
 		end)
-		pcall(fire, cand, targetCF(Flood.target))
-		task.wait(.25)
+		pcall(fire, cand, targetCF(Flood.target), shape)
+		task.wait(.2)
 		pcall(function() conn:Disconnect() end)
 		return hits
 	end
 
 	function Flood.probe(cand)
-		for _, shape in ipairs({ "cframe", "pos", "table_cf", "cf_size", "name_cf", "table_full", "double" }) do
+		if Flood.templates[cand.obj] then
+			local hits = tryShape(cand, "template")
+			if hits > 0 then return "template", hits end
+		end
+		for _, shape in ipairs(SHAPES) do
+			if shape == "template" then continue end
 			local hits = tryShape(cand, shape)
 			if hits > 0 then return shape, hits end
 		end
@@ -1417,33 +1604,38 @@ local function main()
 			Flood.created += 1
 			if Flood.created >= budget then Flood.stop("budget") end
 		end)
-		task.spawn(function()
-			while Flood.running do
-				if Flood.localMode then
-					for _ = 1, Flood.rate do
-						if not Flood.running then break end
-						new("Part", {
-							Name = "KayserPart", Anchored = Flood.anchored,
-							CanCollide = not Flood.anchored, CanQuery = false, CanTouch = false,
-							Size = Vector3.new(2, 2, 2), Color = Color3.fromHSV(math.random(), .8, 1),
-							CFrame = jitter(base, 12), Parent = spamFolder,
-						})
-						Flood.created += 1
-						if Flood.created >= budget then
-							Flood.stop("budget")
-							break
+		local shape = Flood.variant or "cframe"
+		local perWorker = math.max(1, math.floor(Flood.rate / Flood.workers))
+		for w = 1, Flood.workers do
+			task.spawn(function()
+				while Flood.running do
+					if Flood.localMode then
+						for _ = 1, perWorker do
+							if not Flood.running then break end
+							new("Part", {
+								Name = "KayserPart", Anchored = Flood.anchored,
+								CanCollide = not Flood.anchored, CanQuery = false, CanTouch = false,
+								Size = Vector3.new(2, 2, 2), Color = Color3.fromHSV(math.random(), .8, 1),
+								CFrame = jitter(base, 12), Parent = spamFolder,
+							})
+							Flood.created += 1
+							if Flood.created >= budget then
+								Flood.stop("budget")
+								break
+							end
+						end
+					else
+						for _ = 1, perWorker do
+							if not Flood.running then break end
+							fire(Flood.selected, jitter(base, 8), shape)
 						end
 					end
-				else
-					for _ = 1, Flood.rate do
-						if not Flood.running then break end
-						fire(Flood.selected, jitter(base, 8))
-					end
+					task.wait(Flood.lag > 0 and Flood.lag or 0)
 				end
-				task.wait(1)
-			end
-		end)
-		notify(("flooding %s @ %d/s · cap %d"):format(name ~= "" and name or "server", Flood.rate, budget), 4)
+			end)
+		end
+		notify(("flooding %s · %s · %d/s x %d · cap %d"):format(
+			name ~= "" and name or "server", shape, Flood.rate, Flood.workers, budget), 4)
 	end
 
 	function Flood.wipe()
@@ -1769,14 +1961,13 @@ local function main()
 		notify(("%d remotes"):format(#Flood.cands))
 	end)
 	local shapeBtn = mini(mRow1, "shape: cframe", 110, function()
-		local cycles = { "cframe", "pos", "table_cf", "cf_size", "name_cf", "table_full", "double" }
-		for i, s in ipairs(cycles) do
-			if s == Flood.variant then
-				Flood.variant = cycles[(i % #cycles) + 1]
+		for i, s in ipairs(SHAPES) do
+			if s == (Flood.variant or "cframe") then
+				Flood.variant = SHAPES[(i % #SHAPES) + 1]
 				break
 			end
 		end
-		shapeBtn.Text = "shape: " .. Flood.variant
+		shapeBtn.Text = "shape: " .. (Flood.variant or "cframe")
 	end)
 	mini(mRow1, "probe", 56, function()
 		if Flood.busy or not Flood.selected then return notify("select a remote") end
@@ -1786,6 +1977,7 @@ local function main()
 		if s then notify(("hit %s · +%d"):format(s, hits), 4) else notify("no shape worked", 4) end
 		Flood.render()
 	end)
+	mini(mRow1, "harvest", 62, function() Harvest.start(15) end, C.accent)
 	local preHost = new("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, Parent = cManual })
 	box(preHost, "prefix args (5,wood)", function(text)
 		Flood.prefix = {}
@@ -1797,6 +1989,8 @@ local function main()
 	end)
 	slider(cManual, "Rate per second", 50, 2000, 450, function(v) Flood.rate = v end)
 	slider(cManual, "Part budget", 200, 40000, 5000, function(v) Flood.budget = math.floor(v) end)
+	slider(cManual, "Workers", 1, 16, 4, function(v) Flood.workers = math.floor(v) end)
+	slider(cManual, "Iteration delay (s)", 0, 2, 1, function(v) Flood.lag = v end)
 	toggle(cManual, "Unanchored (violent)", false, function(v) Flood.anchored = not v end)
 	button(cManual, "Flood target", function()
 		Flood.target = targetBox.Text
@@ -1873,6 +2067,9 @@ local function main()
 			notify("no clipboard")
 		end
 	end)
+	toggle(cSess, "Retire all limits", false, function(v)
+		if v then Unlimited.enable() else Unlimited.disable() end
+	end, "no client-side caps · server still validates")
 	button(cSess, "Unload", function() try(ENV.__KAYSER_UNLOAD) end, C.warn)
 
 	local cInfo = card(pMain)
@@ -1935,11 +2132,12 @@ local function main()
 					local ping = try(function()
 						return math.floor(game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue())
 					end)
-					status.Text = ("%d fps · %s ms · combat %s · flood %s · ac+%d"):format(
+					status.Text = ("%d fps · %s ms · combat %s · flood %s · ac+%d%s"):format(
 						fps, ping and tostring(ping) or "-",
 						Aim.on and (Aim.silent and "silent" or "aimbot") or "off",
 						Flood.running and "run" or "idle",
-						Bypass.detections_blocked)
+						Bypass.detections_blocked,
+						Unlimited.on and " · ∞" or "")
 				end
 				aimLbl.Text = Aim.target and (Aim.target.Name .. " · " .. math.floor(Aim.silent and Aim.silentFov or Aim.fov) .. "px") or "none"
 				floodLbl.TextColor3 = Flood.running and C.on or C.dim
@@ -1947,7 +2145,7 @@ local function main()
 					floodLbl.Text = ("RUN %d fires · %d/%d parts"):format(Flood.fires, Flood.created, Flood.budget)
 				else
 					floodLbl.Text = ("idle · %s · %s"):format(
-						Flood.selected and Flood.selected.obj.Name or "no remote", Flood.variant)
+						Flood.selected and Flood.selected.obj.Name or "no remote", Flood.variant or "cframe")
 				end
 			end)
 		end
@@ -1956,6 +2154,7 @@ local function main()
 	ENV.__KAYSER_UNLOAD = function()
 		if State.killed then return end
 		State.killed = true
+		if Unlimited.on then Unlimited.disable() end
 		Bypass.enabled = false
 		for _, c in pairs(Bypass.conns) do pcall(function() c:Disconnect() end) end
 		Bypass.conns = {}
@@ -2066,8 +2265,9 @@ local function main()
 	applyMovement()
 	log("executor:", tostring(EX.hint or "unknown"), "| hook:", EX.hook and "yes" or "no",
 		"| drawing:", EX.draw and "yes" or "no", "| io:", IO.ok and "yes" or "no")
-	notify("KAYSER 2.2 loaded · RightShift UI · END unload", 4)
+	notify("KAYSER 2.3 loaded · RightShift UI · END unload", 4)
 	if not EX.hook then notify("silent aim needs hookmetamethod — non supporté", 6) end
+	if not EX.hookfn then notify("harvest unavailable — hookfunction missing", 6) end
 
 	print("[K] boot complete · gui:", Gui.Parent and Gui.Parent:GetFullName() or "NIL",
 		"· enabled:", tostring(Gui.Enabled), "· size:", tostring(win.AbsoluteSize))
