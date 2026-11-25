@@ -210,6 +210,20 @@ local function main()
 
 	local Config = {
 		Fly = { Enabled = false },
+		FOVCircle = {
+			Show      = true,
+			Color     = Color3.fromRGB(255, 255, 255),
+			Thickness = 1.5,
+		},
+		AimTracer = {
+			Enabled    = false,
+			Color      = Color3.fromRGB(255, 80, 80),
+			Thickness  = 1,
+			FromCenter = false,
+			FadeEnd    = true,
+			ShowDot    = true,
+		},
+		Wallbang = { Enabled = false },  -- toggled by Aim.wallbang
 		WalkFling = {
 			Enabled = false,
 			Power = 9e7,
@@ -279,6 +293,7 @@ local function main()
 		AnchorPoint = Vector2.new(.5, .5), BackgroundColor3 = C.bg,
 		BorderSizePixel = 0, Parent = Gui,
 	})
+	menuFrameRef = win   -- lets mouseOverMenu() check visibility
 	corner(win, 12)
 	stroke(win)
 
@@ -567,6 +582,7 @@ local function main()
 		target = nil, headPos = nil,
 		silentOffsetX = 0, silentOffsetY = 0,
 		showFov = true,
+		hitChance = 100,  -- silent aim hit-chance percent (1-100)
 		fovColorR = 124, fovColorG = 152, fovColorB = 255,
 		silentColorR = 255, silentColorG = 180, silentColorB = 60,
 	}
@@ -714,8 +730,9 @@ local function main()
 	end)
 
 	local Hooks = { on = false, origIndex = nil }
-	local fovCircle = nil
-	local silentCircle = nil
+	-- fovCircle / silentCircle are now Frame-based (see boot section)
+	local fovCircleFrame   = nil   -- UIStroke frame for aimbot FOV
+	local silentCircleFrame = nil  -- UIStroke frame for silent FOV
 
 	local Whitelist = {}
 	local function IsWhitelisted(p)
@@ -753,17 +770,71 @@ local function main()
 		return nil
 	end
 
+	----------------------------------------------------------------------
+	-- Silent Aim (transplanted pipeline)
+	----------------------------------------------------------------------
+	local silentCache = { part = nil, pos = nil, plr = nil }
+	local silentRoll, silentRollT = true, 0
+	Hooks.silentConn = nil   -- RenderStepped handle
+
+	local function silentTick()
+		if not (Aim.on and Aim.silent) then
+			silentCache.part, silentCache.pos, silentCache.plr = nil, nil, nil
+			return
+		end
+		local now = os.clock()
+		if now - silentRollT > 0.1 then
+			silentRollT = now
+			silentRoll = math.random(1, 100) <= Aim.hitChance
+		end
+		if not silentRoll then
+			silentCache.part, silentCache.pos, silentCache.plr = nil, nil, nil
+			return
+		end
+		-- reuse Kayser's acquire() — target + head position
+		local ok, t, h = pcall(acquire)
+		if ok and t and h then
+			local ch = t.Character
+			local part = ch and (ch:FindFirstChild("Head") or ch:FindFirstChild("HumanoidRootPart"))
+			silentCache.part = part
+			silentCache.pos  = h
+			silentCache.plr  = t
+		else
+			silentCache.part, silentCache.pos, silentCache.plr = nil, nil, nil
+		end
+	end
+
+	-- _G.DevTools API so external tools can read the pipeline
+	_G.DevTools = _G.DevTools or {}
+	function _G.DevTools.GetAimPosition(defaultPos)
+		return silentCache.pos or defaultPos
+	end
+	function _G.DevTools.GetAimTarget()
+		return silentCache.part
+	end
+	function _G.DevTools.GetAimDirection(origin, defaultDir)
+		local p = silentCache.pos
+		if p and (p - origin).Magnitude > 0.01 then return (p - origin).Unit end
+		return defaultDir
+	end
+
 	local function installHooks()
 		if Hooks.on or not EX.hook then return false end
+
+		-- start the per-frame silent aim roller
+		if not Hooks.silentConn then
+			Hooks.silentConn = RunService.RenderStepped:Connect(silentTick)
+		end
+
 		local okIndex, origIndex = pcall(function()
 			return EX.hook(game, "__index", function(self, key)
-				if Aim.silent and Aim.headPos then
+				if Aim.silent and silentCache.pos and not checkcaller() then
 					if self == mouse then
-						if key == "Hit" then return CFrame.new(Aim.headPos) end
-						if key == "Target" then return Aim.target and Aim.target.Character end
+						if key == "Hit"    then return CFrame.new(silentCache.pos) end
+						if key == "Target" then return silentCache.part end
 						if key == "UnitRay" then
 							local o = CAM.CFrame.Position
-							return Ray.new(o, (Aim.headPos - o).Unit * 2000)
+							return Ray.new(o, (silentCache.pos - o).Unit * 2000)
 						end
 					end
 				end
@@ -786,6 +857,11 @@ local function main()
 		if Hooks.origIndex then
 			pcall(EX.hook, game, "__index", Hooks.origIndex)
 		end
+		if Hooks.silentConn then
+			Hooks.silentConn:Disconnect()
+			Hooks.silentConn = nil
+		end
+		silentCache.part, silentCache.pos, silentCache.plr = nil, nil, nil
 		Hooks.on = false
 	end
 
@@ -797,47 +873,111 @@ local function main()
 		return ch, hum, ch:FindFirstChild("Head") or ch:FindFirstChild("HumanoidRootPart")
 	end
 
-	local function onScreen(pos)
-		local sp, vis = CAM:WorldToViewportPoint(pos)
-		if sp.Z <= 0 then return nil end
-		local vp = CAM.ViewportSize
-		local center = Vector2.new(vp.X * .5, vp.Y * .5)
-		local screenPos = Vector2.new(sp.X, sp.Y)
-		local activeCenter = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
-		local radius = Aim.silent and Aim.silentFov or Aim.fov
-		local d = (screenPos - activeCenter).Magnitude
-		if d > radius then return nil end
-		return d
+	----------------------------------------------------------------------
+	-- Target acquisition (transplanted pipeline)
+	----------------------------------------------------------------------
+	local UIS     = UserInputService   -- alias for incoming helpers
+	local camera  = CAM               -- alias for incoming helpers
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType  = Enum.RaycastFilterType.Exclude
+	rayParams.IgnoreWater = true
+
+	local menuFrameRef = nil   -- set after UI builds (see below)
+
+	local function mouseOverMenu()
+		if not (menuFrameRef and menuFrameRef.Visible) then return false end
+		local m = UIS:GetMouseLocation()
+		local p, sz = menuFrameRef.AbsolutePosition, menuFrameRef.AbsoluteSize
+		return m.X >= p.X and m.X <= p.X + sz.X and m.Y >= p.Y and m.Y <= p.Y + sz.Y
 	end
 
-	local function canSee(ch, pos)
-		if not Aim.wallCheck then return true end
-		local camPos = CAM.CFrame.Position
-		local params = RaycastParams.new()
-		params.FilterType = Enum.RaycastFilterType.Include
-		params.FilterDescendantsInstances = { ch }
-		return rawRaycast(workspace, camPos, pos - camPos, params) ~= nil
-	end
-
-	local function acquire()
-		local best, bestScore, bestPos
-		local _, _, myRoot = getChar()
-		for _, p in ipairs(Players:GetPlayers()) do
-			local skipTeam = Aim.ignoreTeam and player.Team ~= nil and p.Team == player.Team
-			if p ~= player and not skipTeam then
-				local ch, _, head = bodyOf(p)
-				if ch and head then
-					local dist = myRoot and (head.Position - myRoot.Position).Magnitude or 0
-					if dist <= Aim.maxDist then
-						local score = onScreen(head.Position)
-						if score and (bestScore == nil or score < bestScore) and canSee(ch, head.Position) then
-							best, bestScore, bestPos = p, score, head.Position
-						end
-					end
-				end
+	local function isVisible(part)
+		if Config.Wallbang and Config.Wallbang.Enabled then return true end
+		local origin = camera.CFrame.Position
+		local dir = part.Position - origin
+		local ignore = { player.Character }
+		for _ = 1, 8 do
+			rayParams.FilterDescendantsInstances = ignore
+			local res = workspace:Raycast(origin, dir, rayParams)
+			if not res then return true end
+			local inst = res.Instance
+			if inst:IsDescendantOf(part.Parent) then return true end
+			if inst.Transparency >= 0.95 or not inst.CanCollide then
+				table.insert(ignore, inst)
+			else
+				return false
 			end
 		end
-		return best, bestPos
+		return false
+	end
+
+	local function aimCenter(useMouse)
+		if useMouse and UIS.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+			return UIS:GetMouseLocation()
+		end
+		return camera.ViewportSize / 2
+	end
+
+	local function resolveAimPart(char, partName)
+		partName = partName or "Head"
+		local part
+		if partName == "Torso" or partName == "UpperTorso" then
+			part = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+		else
+			part = char:FindFirstChild(partName)
+		end
+		return part or char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head")
+	end
+
+	-- s: table with .FOV, .TeamCheck, .MaxDistance, .Prediction, .PredictionFactor, .WallCheck
+	local function getClosestTarget(s, partName, useMouse)
+		local center = aimCenter(useMouse)
+		local camPos = camera.CFrame.Position
+		local bestScreen, bestWorld, bestPart, bestPlr, bestDist =
+			nil, nil, nil, nil, s.FOV
+
+		for _, other in ipairs(Players:GetPlayers()) do
+			local char = other.Character
+			if other == player or not char then continue end
+			if s.TeamCheck and other.Team ~= nil and other.Team == player.Team then continue end
+
+			local hum  = char:FindFirstChildOfClass("Humanoid")
+			local part = resolveAimPart(char, partName)
+			if not hum or not part or hum.Health <= 0 then continue end
+			if (part.Position - camPos).Magnitude > (s.MaxDistance or s.maxDist or 1200) then continue end
+
+			local pos3D = part.Position
+			if s.Prediction then
+				local root = char:FindFirstChild("HumanoidRootPart")
+				if root then
+					pos3D = pos3D + root.AssemblyLinearVelocity * (s.PredictionFactor or 0.12)
+				end
+			end
+
+			local sp, onScrn = camera:WorldToViewportPoint(pos3D)
+			if not onScrn or sp.Z <= 0 then continue end
+
+			local v = Vector2.new(sp.X, sp.Y)
+			local d = (v - center).Magnitude
+			if d < bestDist and (not s.WallCheck or isVisible(part)) then
+				bestScreen, bestWorld, bestPart, bestPlr, bestDist = v, pos3D, part, other, d
+			end
+		end
+		return bestScreen, bestWorld, bestPart, bestPlr
+	end
+
+	-- Bridge: acquire() → (player, Vector3)  — shape Kayser's combat loop expects
+	local function acquire()
+		local aimCfg = {
+			FOV         = Aim.silent and Aim.silentFov or Aim.fov,
+			TeamCheck   = Aim.ignoreTeam,
+			MaxDistance = Aim.maxDist,
+			Prediction  = false,
+			WallCheck   = Aim.wallCheck,
+		}
+		local _, world, _, plr = getClosestTarget(aimCfg, "Head", Aim.silent)
+		return plr, world
 	end
 
 	local function triggerRapidFire()
@@ -862,28 +1002,35 @@ local function main()
 	end
 
 	local function updateCircle()
-		if not EX.draw then return end
 		local vp = CAM.ViewportSize
 		local center = Vector2.new(vp.X * .5, vp.Y * .5)
 		local activeCenter = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
+		local fc = Config.FOVCircle
 
-		if fovCircle then
-			local showNormal = Aim.on and Aim.showFov and not Aim.silent
-			fovCircle.Visible = showNormal
+		-- aimbot FOV circle (Frame + UIStroke)
+		if fovCircleFrame then
+			local showNormal = Aim.on and Aim.showFov and not Aim.silent and fc.Show
+			fovCircleFrame.Visible = showNormal
 			if showNormal then
-				fovCircle.Position = activeCenter
-				fovCircle.Radius = Aim.fov
-				fovCircle.Color = Aim.target and C.on or Color3.fromRGB(Aim.fovColorR, Aim.fovColorG, Aim.fovColorB)
+				local r = Aim.fov
+				fovCircleFrame.Position = UDim2.fromOffset(activeCenter.X, activeCenter.Y)
+				fovCircleFrame.Size     = UDim2.fromOffset(r * 2, r * 2)
+				fovCircleFrame:FindFirstChildOfClass("UIStroke").Color     = Aim.target and C.on or fc.Color
+				fovCircleFrame:FindFirstChildOfClass("UIStroke").Thickness = fc.Thickness
 			end
 		end
 
-		if silentCircle then
-			local showSilent = Aim.on and Aim.showFov and Aim.silent
-			silentCircle.Visible = showSilent
+		-- silent FOV circle (Frame + UIStroke)
+		if silentCircleFrame then
+			local showSilent = Aim.on and Aim.showFov and Aim.silent and fc.Show
+			silentCircleFrame.Visible = showSilent
 			if showSilent then
-				silentCircle.Position = activeCenter
-				silentCircle.Radius = Aim.silentFov
-				silentCircle.Color = Aim.target and C.on or Color3.fromRGB(Aim.silentColorR, Aim.silentColorG, Aim.silentColorB)
+				local r = Aim.silentFov
+				silentCircleFrame.Position = UDim2.fromOffset(activeCenter.X, activeCenter.Y)
+				silentCircleFrame.Size     = UDim2.fromOffset(r * 2, r * 2)
+				silentCircleFrame:FindFirstChildOfClass("UIStroke").Color     = Aim.target and C.on
+					or Color3.fromRGB(Aim.silentColorR, Aim.silentColorG, Aim.silentColorB)
+				silentCircleFrame:FindFirstChildOfClass("UIStroke").Thickness = fc.Thickness
 			end
 		end
 	end
@@ -1669,6 +1816,7 @@ local function main()
 	end, "hooks Mouse properties / Raycast namecalls")
 	toggle(cAim, "Wallbang", false, function(v)
 		Aim.wallbang = v
+		Config.Wallbang.Enabled = v
 		ensureCombat()
 	end, "raycast skips non-character hits")
 	toggle(cAim, "Auto fire on target", false, function(v)
@@ -1683,6 +1831,7 @@ local function main()
 	end)
 	slider(cAim, "FOV radius (px)", 40, 800, 260, function(v) Aim.fov = v end)
 	slider(cAim, "Silent FOV radius (px)", 40, 800, 260, function(v) Aim.silentFov = v end)
+	slider(cAim, "Silent hit chance (%)", 1, 100, 100, function(v) Aim.hitChance = v end)
 	slider(cAim, "Silent FOV offset X", -600, 600, 0, function(v) Aim.silentOffsetX = v end)
 	slider(cAim, "Silent FOV offset Y", -400, 400, 0, function(v) Aim.silentOffsetY = v end)
 	local cFovColor = card(pCombat)
@@ -2162,11 +2311,14 @@ local function main()
 		for _, c in pairs(State.conns) do pcall(function() c:Disconnect() end) end
 		State.conns = {}
 		removeHooks()
-		if fovCircle then
-			pcall(function() fovCircle:Destroy() end)
-			fovCircle = nil
+		if fovCircleFrame then
+			pcall(function() fovCircleFrame:Destroy() end)
+			fovCircleFrame = nil
 		end
-		if silentCircle then pcall(function() silentCircle:Destroy() end) silentCircle = nil end
+		if silentCircleFrame then
+			pcall(function() silentCircleFrame:Destroy() end)
+			silentCircleFrame = nil
+		end
 		for p, set in pairs(ESP) do
 			for _, o in pairs(set) do pcall(function() o:Destroy() end) end
 			ESP[p] = nil
@@ -2204,23 +2356,128 @@ local function main()
 	--==========================================================
 	-- 10. boot
 	--==========================================================
-	if EX.draw then
-		fovCircle = try(function() return Drawing.new("Circle") end)
-		if fovCircle then
-			fovCircle.Thickness = 1.5
-			fovCircle.Filled = false
-			fovCircle.NumSides = 64
-			fovCircle.Transparency = .8
-			fovCircle.Visible = false
+	-- FOV circles: Frame + UIStroke (no Drawing dependency)
+	do
+		local fovGui = Instance.new("ScreenGui")
+		fovGui.Name              = "KayserFOV"
+		fovGui.ResetOnSpawn      = false
+		fovGui.IgnoreGuiInset    = true
+		fovGui.DisplayOrder      = 49
+		fovGui.ZIndexBehavior    = Enum.ZIndexBehavior.Sibling
+
+		local function makeCircleFrame(parent)
+			local f = Instance.new("Frame")
+			f.AnchorPoint          = Vector2.new(0.5, 0.5)
+			f.BackgroundTransparency = 1
+			f.BorderSizePixel      = 0
+			f.Active               = false
+			f.Visible              = false
+			f.Parent               = parent
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(1, 0)
+			c.Parent = f
+			local s = Instance.new("UIStroke")
+			s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+			s.Color           = Color3.fromRGB(255, 255, 255)
+			s.Thickness       = 1.5
+			s.Parent          = f
+			return f
 		end
-		silentCircle = try(function() return Drawing.new("Circle") end)
-		if silentCircle then
-			silentCircle.Thickness = 1.5
-			silentCircle.Filled = false
-			silentCircle.NumSides = 64
-			silentCircle.Transparency = .8
-			silentCircle.Visible = false
-		end
+
+		fovCircleFrame    = makeCircleFrame(fovGui)
+		silentCircleFrame = makeCircleFrame(fovGui)
+
+		-- AimTracer
+		local tracerHolder = Instance.new("Frame")
+		tracerHolder.Name                 = "AimTracerHolder"
+		tracerHolder.BackgroundTransparency = 1
+		tracerHolder.Size                 = UDim2.fromScale(1, 1)
+		tracerHolder.ZIndex               = 5
+		tracerHolder.Parent               = fovGui
+
+		local aimTracerLine = Instance.new("Frame")
+		aimTracerLine.Name             = "AimTracer"
+		aimTracerLine.AnchorPoint      = Vector2.new(0.5, 0.5)
+		aimTracerLine.BorderSizePixel  = 0
+		aimTracerLine.BackgroundColor3 = Config.AimTracer.Color
+		aimTracerLine.Size             = UDim2.fromOffset(2, 2)
+		aimTracerLine.Visible          = false
+		aimTracerLine.ZIndex           = 5
+		aimTracerLine.Parent           = tracerHolder
+		local tracerGradient = Instance.new("UIGradient")
+		tracerGradient.Parent = aimTracerLine
+
+		local aimDot = Instance.new("Frame")
+		aimDot.AnchorPoint      = Vector2.new(0.5, 0.5)
+		aimDot.Size             = UDim2.fromOffset(8, 8)
+		aimDot.BackgroundColor3 = Config.AimTracer.Color
+		aimDot.BorderSizePixel  = 0
+		aimDot.Visible          = false
+		aimDot.ZIndex           = 6
+		aimDot.Parent           = tracerHolder
+		local dotCorner = Instance.new("UICorner")
+		dotCorner.CornerRadius = UDim.new(1, 0)
+		dotCorner.Parent = aimDot
+		local dotStroke = Instance.new("UIStroke")
+		dotStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		dotStroke.Color           = Color3.new(1, 1, 1)
+		dotStroke.Thickness       = 1
+		dotStroke.Parent          = aimDot
+
+		-- AimTracer render loop
+		RunService.RenderStepped:Connect(function()
+			local cfg = Config.AimTracer
+			if not cfg.Enabled then
+				aimTracerLine.Visible = false
+				aimDot.Visible = false
+				return
+			end
+			-- use Kayser's acquire() result
+			local ok, t, h = pcall(acquire)
+			if not (ok and h) then
+				aimTracerLine.Visible = false
+				aimDot.Visible = false
+				return
+			end
+			local sp, onScrn = CAM:WorldToViewportPoint(h)
+			if not onScrn or sp.Z <= 0 then
+				aimTracerLine.Visible = false
+				aimDot.Visible = false
+				return
+			end
+			local screenPos = Vector2.new(sp.X, sp.Y)
+			local vp       = CAM.ViewportSize
+			local origin   = cfg.FromCenter
+				and Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+				or  Vector2.new(vp.X * 0.5, vp.Y - 28)
+			local delta = screenPos - origin
+			local mid   = (origin + screenPos) / 2
+			aimTracerLine.Position        = UDim2.fromOffset(mid.X, mid.Y)
+			aimTracerLine.Size            = UDim2.fromOffset(delta.Magnitude, math.max(1, cfg.Thickness))
+			aimTracerLine.Rotation        = math.deg(math.atan2(delta.Y, delta.X))
+			aimTracerLine.BackgroundColor3 = cfg.Color
+			if cfg.FadeEnd then
+				tracerGradient.Color    = ColorSequence.new({
+					ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+					ColorSequenceKeypoint.new(1, Color3.new(0.3, 0.3, 0.3)),
+				})
+				tracerGradient.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+			else
+				tracerGradient.Color = ColorSequence.new(Color3.new(1, 1, 1))
+			end
+			aimTracerLine.Visible = true
+			aimDot.Position        = UDim2.fromOffset(screenPos.X, screenPos.Y)
+			aimDot.BackgroundColor3 = cfg.Color
+			aimDot.Size            = UDim2.fromOffset(8 + cfg.Thickness * 2, 8 + cfg.Thickness * 2)
+			aimDot.Visible         = cfg.ShowDot
+		end)
+
+		task.spawn(function()
+			local pg = player:WaitForChild("PlayerGui")
+			local old = pg:FindFirstChild("KayserFOV")
+			if old then old:Destroy() end
+			fovGui.Parent = pg
+		end)
 	end
 
 	do
