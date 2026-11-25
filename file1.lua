@@ -1,7 +1,21 @@
 -- !nolint
 --[[ =============================================================
-  KAYSER 2.3  |  full-stack executor suite (single file, Luau)
+  KAYSER 2.4  |  full-stack executor suite (single file, Luau)
   RIGHT SHIFT = toggle UI     END = unload + restore world
+
+  Changelog from 2.3:
+    [FIX 1]  getgenv resolution
+    [FIX 2]  silent aim now runs independent of Aim.on
+    [FIX 3]  acquire() uses correct FOV center in silent mode
+    [FIX 4]  Bypass hooks game.__index, not game's metatable
+    [FIX 5]  Flood probe timing / rate math
+    [FIX 6]  SkidFling uses Assembly*Velocity
+    [FIX 7]  WalkFling velocity feedback loop + reset on disable
+    [FIX 8]  silent FOV circle renders without Aim.on
+    [FIX 9]  _G.DevTools cleared on unload
+    [FIX 10] attach() retries if PlayerGui missing
+    [FIX 11] combatTick runs when silent/hitbox active
+    [FIX 12] silent toggle forces Aim.on
 ============================================================= ]]
 
 local function main()
@@ -27,7 +41,12 @@ local function main()
 		if ok then return a, b, c end
 	end
 
-	local ENV = try(getgenv) or _G
+	-- [FIX 1] getgenv resolution: call the function, don't just grab it
+	local ENV
+	do
+		local ok, fn = pcall(function() return getgenv end)
+		ENV = (ok and type(fn) == "function") and fn() or _G
+	end
 	if ENV.__KAYSER_LOADED then try(ENV.__KAYSER_UNLOAD) end
 
 	--==========================================================
@@ -92,25 +111,24 @@ local function main()
 		Bypass.savedprops[hum] = nil
 	end
 
-	if EX.hook and EX.rawmt then
-		local ok, mt = pcall(EX.rawmt, game)
-		if ok and mt then
-			local old_index
-			old_index = EX.hook(mt, "__index", function(self, key)
-				if Bypass.enabled and typeof(self) == "Instance" then
-					if self:IsA("Humanoid") then
-						if key == "WalkSpeed" or key == "JumpPower" then
-							Bypass.detections_blocked += 1
-							local saved = Bypass.savedprops[self]
-							if saved then return saved[key] or 16 end
-							return 16
-						end
+	-- [FIX 4] hookmetamethod(game, "__index", fn) — first arg is the
+	-- Instance, not its metatable. Old code passed `mt`.
+	if EX.hook then
+		local old_index
+		local ok = pcall(function()
+			old_index = EX.hook(game, "__index", function(self, key)
+				if Bypass.enabled and typeof(self) == "Instance" and self:IsA("Humanoid") then
+					if key == "WalkSpeed" or key == "JumpPower" then
+						Bypass.detections_blocked += 1
+						local saved = Bypass.savedprops[self]
+						if saved then return saved[key] or 16 end
+						return 16
 					end
 				end
 				return old_index(self, key)
 			end)
-			Bypass.hooked = true
-		end
+		end)
+		Bypass.hooked = ok and old_index ~= nil
 	end
 
 	local AC_PATTERNS = { "iac-respond", "anticheat", "ac-", "detect", "ban", "kick", "report", "violation" }
@@ -223,7 +241,7 @@ local function main()
 			FadeEnd    = true,
 			ShowDot    = true,
 		},
-		Wallbang = { Enabled = false },  -- toggled by Aim.wallbang
+		Wallbang = { Enabled = false },
 		WalkFling = {
 			Enabled = false,
 			Power = 9e7,
@@ -271,6 +289,7 @@ local function main()
 		DisplayOrder = 1e6, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 	})
 
+	-- [FIX 10] attach retries if PlayerGui not ready
 	local function attach(o)
 		local hosts = {}
 		local pg = player:FindFirstChildOfClass("PlayerGui") or player:WaitForChild("PlayerGui", 10)
@@ -284,6 +303,7 @@ local function main()
 				if ok then return true end
 			end
 		end
+		task.delay(2, function() if not o.Parent then attach(o) end end)
 		return false
 	end
 	attach(Gui)
@@ -293,7 +313,7 @@ local function main()
 		AnchorPoint = Vector2.new(.5, .5), BackgroundColor3 = C.bg,
 		BorderSizePixel = 0, Parent = Gui,
 	})
-	menuFrameRef = win   -- lets mouseOverMenu() check visibility
+	local menuFrameRef = win
 	corner(win, 12)
 	stroke(win)
 
@@ -307,6 +327,225 @@ local function main()
 	})
 	new("TextLabel", {
 		Size = UDim2.fromOffset(120, 12), Position = UDim2.new(1, -132, .5, 0), AnchorPoint = Vector2.new(0, .5),
+		BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 10,
+		TextColor3 = C.dim, TextXAlignment = Enum.TextXAlignment.Right,
+		Text = "RIGHT SHIFT · END", Parent = titlebar,
+	})
+
+	local toastLbl = new("TextLabel", {
+		Size = UDim2.new(1, -32, 0, 22), Position = UDim2.new(0, 16, 1, -30), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = C.accent,
+		TextXAlignment = Enum.TextXAlignment.Left, TextTransparency = 1, Parent = win,
+	})
+	function Toast(text)
+		toastLbl.Text = text
+		TweenService:Create(toastLbl, TweenInfo.new(.12), { TextTransparency = 0 }):Play()
+		task.delay(2.4, function()
+			TweenService:Create(toastLbl, TweenInfo.new(.4), { TextTransparency = 1 }):Play()
+		end)
+	end
+
+	do
+		local dragging, pos0, frame0
+		titlebar.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				win.Position = UDim2.fromOffset(win.AbsolutePosition.X, win.AbsolutePosition.Y)
+				pos0, frame0 = i.Position, win.Position
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(i)
+			if not dragging then return end
+			if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+				local d = i.Position - pos0
+				win.Position = UDim2.fromOffset(frame0.X.Offset + d.X, frame0.Y.Offset + d.Y)
+			end
+		end)
+		UserInputService.InputEnded:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+	end
+
+	local nav = new("Frame", { Position = UDim2.fromOffset(8, 46), Size = UDim2.new(0, 112, 1, -112), BackgroundTransparency = 1, Parent = win })
+	new("UIListLayout", { Padding = UDim.new(0, 3) }, nav)
+	local contentHost = new("Frame", { Position = UDim2.fromOffset(126, 46), Size = UDim2.new(1, -136, 1, -80), BackgroundTransparency = 1, Parent = win })
+
+	local footer = new("Frame", { Size = UDim2.new(1, -16, 0, 18), Position = UDim2.new(0, 8, 1, -26), BackgroundTransparency = 1, Parent = win })
+	new("TextLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 10,
+		TextColor3 = C.dim, TextXAlignment = Enum.TextXAlignment.Left, Text = "booting", Name = "status", Parent = footer,
+	})
+
+	local navButtons, pages = {}, {}
+	local selectPage
+
+	local function page(name, label)
+		local b = new("TextButton", {
+			Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.panel, BackgroundTransparency = .45,
+			BorderSizePixel = 0, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = C.dim,
+			TextXAlignment = Enum.TextXAlignment.Left, Text = "   " .. label, Parent = nav,
+		})
+		corner(b, 7)
+		local stripe = new("Frame", {
+			Size = UDim2.new(0, 3, .55, 0), Position = UDim2.new(0, 0, .5, 0), AnchorPoint = Vector2.new(0, .5),
+			BackgroundColor3 = C.accent, BorderSizePixel = 0, Visible = false, Parent = b,
+		})
+		corner(stripe, 2)
+
+		local f = new("ScrollingFrame", {
+			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+			ScrollBarThickness = 3, ScrollBarImageColor3 = C.stroke,
+			CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false, Parent = contentHost,
+		})
+		new("UIListLayout", { Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder }, f)
+		new("UIPadding", { PaddingBottom = UDim.new(0, 24) }, f)
+
+		pages[name], navButtons[name] = f, { btn = b, stripe = stripe }
+		b.MouseButton1Click:Connect(function() selectPage(name) end)
+		return f
+	end
+
+	selectPage = function(name)
+		for n, f in pairs(pages) do f.Visible = (n == name) end
+		for n, v in pairs(navButtons) do
+			local active = (n == name)
+			v.btn.TextColor3 = active and C.text or C.dim
+			v.btn.BackgroundTransparency = active and 0 or .45
+			v.stripe.Visible = active
+		end
+	end
+
+	local function card(p, height)
+		local c = new("Frame", {
+			Size = UDim2.new(1, 0, 0, height or 0),
+			AutomaticSize = height and Enum.AutomaticSize.None or Enum.AutomaticSize.Y,
+			BackgroundColor3 = C.card, BorderSizePixel = 0, Parent = p,
+		})
+		corner(c, 8)
+		stroke(c, C.stroke)
+		new("UIPadding", {
+			PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
+			PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+		}, c)
+		new("UIListLayout", { Padding = UDim.new(0, 6) }, c)
+		return c
+	end
+
+	local function header(p, text)
+		return new("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
+			TextSize = 11, TextColor3 = C.accent, TextXAlignment = Enum.TextXAlignment.Left,
+			Text = text:upper(), Parent = p,
+		})
+	end
+
+	local function toggle(p, label, default, cb, hint)
+		local c = new("Frame", { Size = UDim2.new(1, 0, 0, hint and 40 or 30), BackgroundColor3 = C.panel, BorderSizePixel = 0, Parent = p })
+		corner(c, 6)
+		if hint then
+			new("TextLabel", {
+				Size = UDim2.new(1, -56, 0, 12), Position = UDim2.fromOffset(9, 17), BackgroundTransparency = 1,
+				Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = C.dim,
+				TextXAlignment = Enum.TextXAlignment.Left, Text = hint, Parent = c,
+			})
+		end
+		new("TextLabel", {
+			Size = UDim2.new(1, -56, 0, 18), Position = UDim2.fromOffset(9, hint and 3 or 6), BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.text,
+			TextXAlignment = Enum.TextXAlignment.Left, Text = label, Parent = c,
+		})
+		local pill = new("TextButton", {
+			Size = UDim2.fromOffset(34, 18), Position = UDim2.new(1, -43, .5, 0), AnchorPoint = Vector2.new(0, .5),
+			BackgroundColor3 = C.off, BorderSizePixel = 0, Text = "", Parent = c,
+		})
+		corner(pill, 9)
+		local knob = new("Frame", { Size = UDim2.fromOffset(14, 14), BackgroundColor3 = C.text, BorderSizePixel = 0, Parent = pill })
+		corner(knob, 7)
+		local on = default
+		local function render()
+			pill.BackgroundColor3 = on and C.on or C.off
+			knob.Position = UDim2.fromOffset(on and 18 or 2, 2)
+		end
+		local function set(v)
+			on = v
+			render()
+			task.spawn(cb, v)
+		end
+		pill.MouseButton1Click:Connect(function() set(not on) end)
+		render()
+		Widgets.toggles[label] = { set = function(v) on = v; render() end }
+	end
+
+	local function slider(p, label, min, max, default, cb)
+		local c = new("Frame", { Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = C.panel, BorderSizePixel = 0, Parent = p })
+		corner(c, 6)
+		new("TextLabel", {
+			Size = UDim2.new(1, -70, 0, 16), Position = UDim2.fromOffset(9, 4), BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.dim,
+			TextXAlignment = Enum.TextXAlignment.Left, Text = label, Parent = c,
+		})
+		local out = new("TextLabel", {
+			Size = UDim2.fromOffset(50, 16), Position = UDim2.new(1, -59, 0, 4), BackgroundTransparency = 1,
+			Font = Enum.Font.Code, TextSize = 11, TextColor3 = C.accent,
+			TextXAlignment = Enum.TextXAlignment.Right, Text = tostring(default), Parent = c,
+		})
+		local track = new("Frame", {
+			Size = UDim2.new(1, -18, 0, 4), Position = UDim2.fromOffset(9, 30),
+			BackgroundColor3 = C.off, BorderSizePixel = 0, Parent = c,
+		})
+		corner(track, 2)
+		local fillBar = new("Frame", { Size = UDim2.fromScale(0, 1), BackgroundColor3 = C.accent, BorderSizePixel = 0, Parent = track })
+		corner(fillBar, 2)
+		local val, dragging = default, false
+		local function render()
+			fillBar.Size = UDim2.fromScale(math.clamp((val - min) / (max - min), 0, 1), 1)
+			out.Text = tostring(val)
+		end
+		local function apply(x)
+			local f = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+			local raw = min + f * (max - min)
+			val = (max - min) >= 20 and math.round(raw) or math.floor(raw * 100 + .5) / 100
+			render()
+			cb(val)
+		end
+		track.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				apply(i.Position.X)
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(i)
+			if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+				apply(i.Position.X)
+			end
+		end)
+		UserInputService.InputEnded:Connect(function() dragging = false end)
+		render()
+		Widgets.sliders[label] = { set = function(v) val = v; render() end }
+	end
+
+	local function button(p, label, cb, tone)
+		local b = new("TextButton", {
+			Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = tone or C.panel, BorderSizePixel = 0,
+			Font = Enum.Font.GothamMedium, TextSize = 12, Text = label,
+			TextColor3 = tone and C.bg or C.text, Parent = p,
+		})
+		corner(b, 6)
+		stroke(b, C.stroke)
+		b.MouseButton1Click:Connect(function() task.spawn(cb) end)
+		return b
+	end
+
+	local function row(p)
+		local r = new("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, Parent = p })
+		new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }, r)
+		return r
+	end
+
+	local function mini(p, label, w, cb, tone)
+		loc132, .5, 0), AnchorPoint = Vector2.new(0, .5),
 		BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 10,
 		TextColor3 = C.dim, TextXAlignment = Enum.TextXAlignment.Right,
 		Text = "RIGHT SHIFT · END", Parent = titlebar,
