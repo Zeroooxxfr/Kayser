@@ -1,21 +1,34 @@
 -- !nolint
 --[[ =============================================================
-  KAYSER 2.4  |  full-stack executor suite (single file, Luau)
+  KAYSER 2.5  |  full-stack executor suite (single file, Luau)
   RIGHT SHIFT = toggle UI     END = unload + restore world
 
-  Changelog from 2.3:
-    [FIX 1]  getgenv resolution
-    [FIX 2]  silent aim now runs independent of Aim.on
-    [FIX 3]  acquire() uses correct FOV center in silent mode
-    [FIX 4]  Bypass hooks game.__index, not game's metatable
-    [FIX 5]  Flood probe timing / rate math
-    [FIX 6]  SkidFling uses Assembly*Velocity
-    [FIX 7]  WalkFling velocity feedback loop + reset on disable
-    [FIX 8]  silent FOV circle renders without Aim.on
-    [FIX 9]  _G.DevTools cleared on unload
-    [FIX 10] attach() retries if PlayerGui missing
-    [FIX 11] combatTick runs when silent/hitbox active
-    [FIX 12] silent toggle forces Aim.on
+  Changelog 2.5 (sur 2.4):
+    [AC 1]  hook __namecall en plus de __index — FireServer/InvokeServer filtrés
+    [AC 2]  hookfunction global sur RemoteEvent.FireServer — report AC avalé
+    [AC 3]  AC remotes hookés en no-op, pas Destroy (moins visible serveur)
+    [AC 4]  getconnections(ScriptContext.Error) désactivé en boucle
+    [AC 5]  setfpscap laissé à 240 à l'unload (pas de flash frame drop)
+    [AC 6]  WalkSpeed/JumpPower reset à la valeur capturée, pas 16
+    [WF 1]  WalkFling Power max 5e4 (était 5e8) — sous le clamp serveur
+    [WF 2]  Spin OFF par défaut (ragdoll soi-même)
+    [WF 3]  HeavyBody OFF par défaut (détectable)
+    [WF 4]  SafeReturn ON par défaut, 50 studs
+    [WF 5]  TriggerRange 10 studs par défaut — fling uniquement si proche
+    [WF 6]  seeding une fois, pas par frame
+    [BF 1]  combatTick tourne pour silent/wallbang/hitbox/fling
+    [BF 2]  acquire useMouse=false en silent
+    [BF 3]  silent toggle force Aim.on
+    [BF 4]  silent circle sans Aim.on
+    [BF 5]  FOV circle utilise les couleurs custom
+    [BF 6]  flood probe snapshot-diff 0.5s
+    [BF 7]  flood rate math corrigée
+    [BF 8]  flood détecte rejet serveur
+    [BF 9]  SkidFling AssemblyLinearVelocity
+    [BF 10] attach retry PlayerGui
+    [BF 11] _G.DevTools cleared unload
+    [BF 12] flingActive reset à la désactivation
+    [BF 13] getgenv résolu correctement
 ============================================================= ]]
 
 local function main()
@@ -41,7 +54,7 @@ local function main()
 		if ok then return a, b, c end
 	end
 
-	-- [FIX 1] getgenv resolution: call the function, don't just grab it
+	-- [BF 13] getgenv résolu correctement
 	local ENV
 	do
 		local ok, fn = pcall(function() return getgenv end)
@@ -53,15 +66,15 @@ local function main()
 	-- 1. executor abstraction
 	--==========================================================
 	local EX = {
-		hook  = (function() local ok, v = pcall(function() return hookmetamethod end) return ok and type(v) == "function" and v or nil end)(),
+		hook    = (function() local ok, v = pcall(function() return hookmetamethod end) return ok and type(v) == "function" and v or nil end)(),
 		namecall = (function() local ok, v = pcall(function() return getnamecallmethod end) return ok and type(v) == "function" and v or nil end)(),
-		rawmt = try(getrawmetatable),
-		input = try(mouse1click),
-		clip  = try(setclipboard),
-		fps   = try(setfpscap),
-		draw  = try(function() return typeof(Drawing) == "table" and Drawing or nil end),
-		hint  = try(identifyexecutor),
-		hookfn = try(function() return hookfunction end),
+		rawmt   = try(getrawmetatable),
+		input   = try(mouse1click),
+		clip    = try(setclipboard),
+		fps     = try(setfpscap),
+		draw    = try(function() return typeof(Drawing) == "table" and Drawing or nil end),
+		hint    = try(identifyexecutor),
+		hookfn  = try(function() return hookfunction end),
 	}
 
 	local Toast
@@ -85,11 +98,14 @@ local function main()
 	local Bypass = {
 		enabled = true,
 		savedprops = {},
-		hooked = false,
+		hooked_index = false,
+		hooked_namecall = false,
+		hooked_fireserver = false,
 		detections_blocked = 0,
 		conns = {},
 	}
 
+	-- [AC 6] sauvegarde les vraies valeurs, pas un fallback hardcodé
 	local function spoof_humanoid(hum)
 		if not hum or not hum:IsA("Humanoid") then return end
 		if Bypass.savedprops[hum] then return end
@@ -111,8 +127,7 @@ local function main()
 		Bypass.savedprops[hum] = nil
 	end
 
-	-- [FIX 4] hookmetamethod(game, "__index", fn) — first arg is the
-	-- Instance, not its metatable. Old code passed `mt`.
+	-- [AC 1] __index : spoof WalkSpeed/JumpPower reads
 	if EX.hook then
 		local old_index
 		local ok = pcall(function()
@@ -121,32 +136,80 @@ local function main()
 					if key == "WalkSpeed" or key == "JumpPower" then
 						Bypass.detections_blocked += 1
 						local saved = Bypass.savedprops[self]
-						if saved then return saved[key] or 16 end
+						if saved then return saved[key] end
 						return 16
 					end
 				end
 				return old_index(self, key)
 			end)
 		end)
-		Bypass.hooked = ok and old_index ~= nil
+		Bypass.hooked_index = ok and old_index ~= nil
 	end
 
-	local AC_PATTERNS = { "iac-respond", "anticheat", "ac-", "detect", "ban", "kick", "report", "violation" }
+	-- [AC 1] __namecall : filtre les namecalls AC-named avant qu'ils partent
+	local AC_PATTERNS = {
+		"iac%-respond", "anticheat", "anti%-cheat", "ac%-", "ac_",
+		"detect", "ban", "kick", "report", "violation", "flag",
+		"exploit", "cheat", "sus", "moderat",
+	}
 
-	local function name_matches_ac(name)
+	local function is_ac_name(name)
 		local n = name:lower()
 		for _, pat in ipairs(AC_PATTERNS) do
-			if n:find(pat, 1, true) then return true end
+			if n:find(pat) then return true end
 		end
 		return false
 	end
 
-	local function kill_ac_remotes()
+	if EX.hook and EX.namecall then
+		local old_namecall
+		local ok = pcall(function()
+			old_namecall = EX.hook(game, "__namecall", function(self, ...)
+				local method = EX.namecall()
+				if Bypass.enabled and method then
+					local m = method:lower()
+					-- bloque les namecalls qui reportent / kick / ban
+					if m == "kick" or m == "fire" or m == "invoke" or m == "fireserver" or m == "invokeserver" then
+						if typeof(self) == "Instance" and is_ac_name(self.Name) then
+							Bypass.detections_blocked += 1
+							return
+						end
+					end
+				end
+				return old_namecall(self, ...)
+			end)
+		end)
+		Bypass.hooked_namecall = ok and old_namecall ~= nil
+	end
+
+	-- [AC 2] hook global FireServer — avale tout report AC
+	if EX.hookfn then
+		local ok = pcall(function()
+			local orig
+			orig = EX.hookfn(Instance.new("RemoteEvent").FireServer, function(self, ...)
+				if Bypass.enabled and typeof(self) == "Instance" and is_ac_name(self.Name) then
+					Bypass.detections_blocked += 1
+					return
+				end
+				return orig(self, ...)
+			end)
+			Bypass.hooked_fireserver = orig ~= nil
+		end)
+	end
+
+	-- [AC 3] AC remotes : hook FireServer en no-op, pas Destroy
+	local function neutralize_ac_remotes()
 		local function scan(parent)
 			for _, child in ipairs(parent:GetDescendants()) do
-				if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
-					if name_matches_ac(child.Name) then
-						pcall(function() child:Destroy() end)
+				if (child:IsA("RemoteEvent") or child:IsA("RemoteFunction")) and is_ac_name(child.Name) then
+					if EX.hookfn then
+						pcall(function()
+							if child:IsA("RemoteEvent") then
+								EX.hookfn(child.FireServer, function() end)
+							else
+								EX.hookfn(child.InvokeServer, function() return nil end)
+							end
+						end)
 					end
 				end
 			end
@@ -154,14 +217,23 @@ local function main()
 		pcall(scan, ReplicatedStorage)
 		pcall(scan, ReplicatedFirst)
 		table.insert(Bypass.conns, ReplicatedStorage.ChildAdded:Connect(function(child)
-			if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
-				if name_matches_ac(child.Name) then
-					task.defer(function() pcall(function() child:Destroy() end) end)
+			if (child:IsA("RemoteEvent") or child:IsA("RemoteFunction")) and is_ac_name(child.Name) then
+				if EX.hookfn then
+					pcall(function()
+						if child:IsA("RemoteEvent") then
+							EX.hookfn(child.FireServer, function() end)
+						else
+							EX.hookfn(child.InvokeServer, function() return nil end)
+						end
+					end)
 				end
 			end
 		end))
 	end
 
+	neutralize_ac_remotes()
+
+	-- [AC 4] désactive les connections d'erreur en boucle, pas une fois
 	local function kill_ac_threads()
 		local ok, gc = pcall(function() return getgc(true) end)
 		if ok and type(gc) == "table" then
@@ -170,7 +242,8 @@ local function main()
 					for k, v in pairs(obj) do
 						if type(k) == "string" then
 							local lk = k:lower()
-							if (lk:find("detect") or lk:find("ban") or lk:find("kick")) and type(v) == "function" then
+							if (lk:find("detect") or lk:find("ban") or lk:find("kick") or lk:find("report"))
+								and type(v) == "function" then
 								pcall(function() obj[k] = function() end end)
 								Bypass.detections_blocked += 1
 							end
@@ -203,7 +276,6 @@ local function main()
 	if player.Character then sanitize_character(player.Character) end
 	table.insert(Bypass.conns, player.CharacterAdded:Connect(sanitize_character))
 
-	kill_ac_remotes()
 	task.defer(kill_ac_threads)
 
 	task.spawn(function()
@@ -242,19 +314,20 @@ local function main()
 			ShowDot    = true,
 		},
 		Wallbang = { Enabled = false },
+		-- [WF 1-5] valeurs safe par défaut
 		WalkFling = {
 			Enabled = false,
-			Power = 9e7,
-			Spin = true,
+			Power = 5e4,
+			Spin = false,
 			TriggerRange = 10,
 			OnlyNearPlayers = true,
-			HeavyBody = true,
-			SafeReturn = false,
+			HeavyBody = false,
+			SafeReturn = true,
 			SafeReturnDistance = 50,
 		},
 		CarFling = {
 			Enabled = false,
-			Power = 9e7,
+			Power = 5e4,
 			Speed = 100,
 		}
 	}
@@ -289,7 +362,7 @@ local function main()
 		DisplayOrder = 1e6, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 	})
 
-	-- [FIX 10] attach retries if PlayerGui not ready
+	-- [BF 10] attach retry
 	local function attach(o)
 		local hosts = {}
 		local pg = player:FindFirstChildOfClass("PlayerGui") or player:WaitForChild("PlayerGui", 10)
@@ -327,225 +400,6 @@ local function main()
 	})
 	new("TextLabel", {
 		Size = UDim2.fromOffset(120, 12), Position = UDim2.new(1, -132, .5, 0), AnchorPoint = Vector2.new(0, .5),
-		BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 10,
-		TextColor3 = C.dim, TextXAlignment = Enum.TextXAlignment.Right,
-		Text = "RIGHT SHIFT · END", Parent = titlebar,
-	})
-
-	local toastLbl = new("TextLabel", {
-		Size = UDim2.new(1, -32, 0, 22), Position = UDim2.new(0, 16, 1, -30), BackgroundTransparency = 1,
-		Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = C.accent,
-		TextXAlignment = Enum.TextXAlignment.Left, TextTransparency = 1, Parent = win,
-	})
-	function Toast(text)
-		toastLbl.Text = text
-		TweenService:Create(toastLbl, TweenInfo.new(.12), { TextTransparency = 0 }):Play()
-		task.delay(2.4, function()
-			TweenService:Create(toastLbl, TweenInfo.new(.4), { TextTransparency = 1 }):Play()
-		end)
-	end
-
-	do
-		local dragging, pos0, frame0
-		titlebar.InputBegan:Connect(function(i)
-			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-				dragging = true
-				win.Position = UDim2.fromOffset(win.AbsolutePosition.X, win.AbsolutePosition.Y)
-				pos0, frame0 = i.Position, win.Position
-			end
-		end)
-		UserInputService.InputChanged:Connect(function(i)
-			if not dragging then return end
-			if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
-				local d = i.Position - pos0
-				win.Position = UDim2.fromOffset(frame0.X.Offset + d.X, frame0.Y.Offset + d.Y)
-			end
-		end)
-		UserInputService.InputEnded:Connect(function(i)
-			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-				dragging = false
-			end
-		end)
-	end
-
-	local nav = new("Frame", { Position = UDim2.fromOffset(8, 46), Size = UDim2.new(0, 112, 1, -112), BackgroundTransparency = 1, Parent = win })
-	new("UIListLayout", { Padding = UDim.new(0, 3) }, nav)
-	local contentHost = new("Frame", { Position = UDim2.fromOffset(126, 46), Size = UDim2.new(1, -136, 1, -80), BackgroundTransparency = 1, Parent = win })
-
-	local footer = new("Frame", { Size = UDim2.new(1, -16, 0, 18), Position = UDim2.new(0, 8, 1, -26), BackgroundTransparency = 1, Parent = win })
-	new("TextLabel", {
-		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 10,
-		TextColor3 = C.dim, TextXAlignment = Enum.TextXAlignment.Left, Text = "booting", Name = "status", Parent = footer,
-	})
-
-	local navButtons, pages = {}, {}
-	local selectPage
-
-	local function page(name, label)
-		local b = new("TextButton", {
-			Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.panel, BackgroundTransparency = .45,
-			BorderSizePixel = 0, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = C.dim,
-			TextXAlignment = Enum.TextXAlignment.Left, Text = "   " .. label, Parent = nav,
-		})
-		corner(b, 7)
-		local stripe = new("Frame", {
-			Size = UDim2.new(0, 3, .55, 0), Position = UDim2.new(0, 0, .5, 0), AnchorPoint = Vector2.new(0, .5),
-			BackgroundColor3 = C.accent, BorderSizePixel = 0, Visible = false, Parent = b,
-		})
-		corner(stripe, 2)
-
-		local f = new("ScrollingFrame", {
-			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
-			ScrollBarThickness = 3, ScrollBarImageColor3 = C.stroke,
-			CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false, Parent = contentHost,
-		})
-		new("UIListLayout", { Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder }, f)
-		new("UIPadding", { PaddingBottom = UDim.new(0, 24) }, f)
-
-		pages[name], navButtons[name] = f, { btn = b, stripe = stripe }
-		b.MouseButton1Click:Connect(function() selectPage(name) end)
-		return f
-	end
-
-	selectPage = function(name)
-		for n, f in pairs(pages) do f.Visible = (n == name) end
-		for n, v in pairs(navButtons) do
-			local active = (n == name)
-			v.btn.TextColor3 = active and C.text or C.dim
-			v.btn.BackgroundTransparency = active and 0 or .45
-			v.stripe.Visible = active
-		end
-	end
-
-	local function card(p, height)
-		local c = new("Frame", {
-			Size = UDim2.new(1, 0, 0, height or 0),
-			AutomaticSize = height and Enum.AutomaticSize.None or Enum.AutomaticSize.Y,
-			BackgroundColor3 = C.card, BorderSizePixel = 0, Parent = p,
-		})
-		corner(c, 8)
-		stroke(c, C.stroke)
-		new("UIPadding", {
-			PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
-			PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
-		}, c)
-		new("UIListLayout", { Padding = UDim.new(0, 6) }, c)
-		return c
-	end
-
-	local function header(p, text)
-		return new("TextLabel", {
-			Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
-			TextSize = 11, TextColor3 = C.accent, TextXAlignment = Enum.TextXAlignment.Left,
-			Text = text:upper(), Parent = p,
-		})
-	end
-
-	local function toggle(p, label, default, cb, hint)
-		local c = new("Frame", { Size = UDim2.new(1, 0, 0, hint and 40 or 30), BackgroundColor3 = C.panel, BorderSizePixel = 0, Parent = p })
-		corner(c, 6)
-		if hint then
-			new("TextLabel", {
-				Size = UDim2.new(1, -56, 0, 12), Position = UDim2.fromOffset(9, 17), BackgroundTransparency = 1,
-				Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = C.dim,
-				TextXAlignment = Enum.TextXAlignment.Left, Text = hint, Parent = c,
-			})
-		end
-		new("TextLabel", {
-			Size = UDim2.new(1, -56, 0, 18), Position = UDim2.fromOffset(9, hint and 3 or 6), BackgroundTransparency = 1,
-			Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.text,
-			TextXAlignment = Enum.TextXAlignment.Left, Text = label, Parent = c,
-		})
-		local pill = new("TextButton", {
-			Size = UDim2.fromOffset(34, 18), Position = UDim2.new(1, -43, .5, 0), AnchorPoint = Vector2.new(0, .5),
-			BackgroundColor3 = C.off, BorderSizePixel = 0, Text = "", Parent = c,
-		})
-		corner(pill, 9)
-		local knob = new("Frame", { Size = UDim2.fromOffset(14, 14), BackgroundColor3 = C.text, BorderSizePixel = 0, Parent = pill })
-		corner(knob, 7)
-		local on = default
-		local function render()
-			pill.BackgroundColor3 = on and C.on or C.off
-			knob.Position = UDim2.fromOffset(on and 18 or 2, 2)
-		end
-		local function set(v)
-			on = v
-			render()
-			task.spawn(cb, v)
-		end
-		pill.MouseButton1Click:Connect(function() set(not on) end)
-		render()
-		Widgets.toggles[label] = { set = function(v) on = v; render() end }
-	end
-
-	local function slider(p, label, min, max, default, cb)
-		local c = new("Frame", { Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = C.panel, BorderSizePixel = 0, Parent = p })
-		corner(c, 6)
-		new("TextLabel", {
-			Size = UDim2.new(1, -70, 0, 16), Position = UDim2.fromOffset(9, 4), BackgroundTransparency = 1,
-			Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.dim,
-			TextXAlignment = Enum.TextXAlignment.Left, Text = label, Parent = c,
-		})
-		local out = new("TextLabel", {
-			Size = UDim2.fromOffset(50, 16), Position = UDim2.new(1, -59, 0, 4), BackgroundTransparency = 1,
-			Font = Enum.Font.Code, TextSize = 11, TextColor3 = C.accent,
-			TextXAlignment = Enum.TextXAlignment.Right, Text = tostring(default), Parent = c,
-		})
-		local track = new("Frame", {
-			Size = UDim2.new(1, -18, 0, 4), Position = UDim2.fromOffset(9, 30),
-			BackgroundColor3 = C.off, BorderSizePixel = 0, Parent = c,
-		})
-		corner(track, 2)
-		local fillBar = new("Frame", { Size = UDim2.fromScale(0, 1), BackgroundColor3 = C.accent, BorderSizePixel = 0, Parent = track })
-		corner(fillBar, 2)
-		local val, dragging = default, false
-		local function render()
-			fillBar.Size = UDim2.fromScale(math.clamp((val - min) / (max - min), 0, 1), 1)
-			out.Text = tostring(val)
-		end
-		local function apply(x)
-			local f = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
-			local raw = min + f * (max - min)
-			val = (max - min) >= 20 and math.round(raw) or math.floor(raw * 100 + .5) / 100
-			render()
-			cb(val)
-		end
-		track.InputBegan:Connect(function(i)
-			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-				dragging = true
-				apply(i.Position.X)
-			end
-		end)
-		UserInputService.InputChanged:Connect(function(i)
-			if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-				apply(i.Position.X)
-			end
-		end)
-		UserInputService.InputEnded:Connect(function() dragging = false end)
-		render()
-		Widgets.sliders[label] = { set = function(v) val = v; render() end }
-	end
-
-	local function button(p, label, cb, tone)
-		local b = new("TextButton", {
-			Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = tone or C.panel, BorderSizePixel = 0,
-			Font = Enum.Font.GothamMedium, TextSize = 12, Text = label,
-			TextColor3 = tone and C.bg or C.text, Parent = p,
-		})
-		corner(b, 6)
-		stroke(b, C.stroke)
-		b.MouseButton1Click:Connect(function() task.spawn(cb) end)
-		return b
-	end
-
-	local function row(p)
-		local r = new("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, Parent = p })
-		new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }, r)
-		return r
-	end
-
-	local function mini(p, label, w, cb, tone)
-		loc132, .5, 0), AnchorPoint = Vector2.new(0, .5),
 		BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 10,
 		TextColor3 = C.dim, TextXAlignment = Enum.TextXAlignment.Right,
 		Text = "RIGHT SHIFT · END", Parent = titlebar,
@@ -821,7 +675,7 @@ local function main()
 		target = nil, headPos = nil,
 		silentOffsetX = 0, silentOffsetY = 0,
 		showFov = true,
-		hitChance = 100,  -- silent aim hit-chance percent (1-100)
+		hitChance = 100,
 		fovColorR = 124, fovColorG = 152, fovColorB = 255,
 		silentColorR = 255, silentColorG = 180, silentColorB = 60,
 	}
@@ -836,6 +690,7 @@ local function main()
 	local flingMassOn = false
 	local flingChar = nil
 	local lastSafeCF = nil
+	local flingSeeded = false
 
 	local function setFlingMass(on)
 		if on then
@@ -876,11 +731,14 @@ local function main()
 		return false
 	end
 
+	-- [WF 6] seeding une fois, pas par frame
+	-- [WF 1-5] puissance réduite, spin off, heavy body off, safe return on
 	RunService.Heartbeat:Connect(function()
 		local wf = Config.WalkFling
 		local active = wf.Enabled and not Config.Fly.Enabled
 		if not active then
 			if flingMassOn then setFlingMass(false) end
+			flingSeeded = false
 			lastSafeCF = nil
 			return
 		end
@@ -897,27 +755,29 @@ local function main()
 			char:PivotTo(lastSafeCF)
 			root.AssemblyLinearVelocity = Vector3.zero
 			root.AssemblyAngularVelocity = Vector3.zero
+			flingSeeded = false
 			return
 		end
 
 		if wf.OnlyNearPlayers and not nearOtherPlayer(root, wf.TriggerRange) then
 			if wf.SafeReturn then lastSafeCF = root.CFrame end
+			flingSeeded = false
 			return
 		end
 
-		flingVel = root.AssemblyLinearVelocity
-		flingAng = root.AssemblyAngularVelocity
-
-		local base = flingVel
-		if Vector3.new(base.X, 0, base.Z).Magnitude < 1 then
-			base = root.CFrame.LookVector * 16
+		if not flingSeeded then
+			local base = root.AssemblyLinearVelocity
+			if Vector3.new(base.X, 0, base.Z).Magnitude < 1 then
+				base = root.CFrame.LookVector * 16
+			end
+			flingVel = base * wf.Power + Vector3.new(0, wf.Power, 0)
+			flingAng = wf.Spin and Vector3.new(0, wf.Power, 0) or Vector3.zero
+			flingSeeded = true
 		end
 
 		flingActive = true
-		root.AssemblyLinearVelocity = base * wf.Power + Vector3.new(0, wf.Power, 0)
-		if wf.Spin then
-			root.AssemblyAngularVelocity = Vector3.new(0, wf.Power, 0)
-		end
+		root.AssemblyLinearVelocity = flingVel
+		root.AssemblyAngularVelocity = flingAng
 	end)
 
 	RunService.Heartbeat:Connect(function()
@@ -969,9 +829,8 @@ local function main()
 	end)
 
 	local Hooks = { on = false, origIndex = nil }
-	-- fovCircle / silentCircle are now Frame-based (see boot section)
-	local fovCircleFrame   = nil   -- UIStroke frame for aimbot FOV
-	local silentCircleFrame = nil  -- UIStroke frame for silent FOV
+	local fovCircleFrame    = nil
+	local silentCircleFrame = nil
 
 	local Whitelist = {}
 	local function IsWhitelisted(p)
@@ -1010,11 +869,11 @@ local function main()
 	end
 
 	----------------------------------------------------------------------
-	-- Silent Aim (transplanted pipeline)
+	-- Silent aim
 	----------------------------------------------------------------------
 	local silentCache = { part = nil, pos = nil, plr = nil }
 	local silentRoll, silentRollT = true, 0
-	Hooks.silentConn = nil   -- RenderStepped handle
+	Hooks.silentConn = nil
 
 	local function silentTick()
 		if not (Aim.on and Aim.silent) then
@@ -1030,7 +889,6 @@ local function main()
 			silentCache.part, silentCache.pos, silentCache.plr = nil, nil, nil
 			return
 		end
-		-- reuse Kayser's acquire() — target + head position
 		local ok, t, h = pcall(acquire)
 		if ok and t and h then
 			local ch = t.Character
@@ -1043,7 +901,6 @@ local function main()
 		end
 	end
 
-	-- _G.DevTools API so external tools can read the pipeline
 	_G.DevTools = _G.DevTools or {}
 	function _G.DevTools.GetAimPosition(defaultPos)
 		return silentCache.pos or defaultPos
@@ -1060,7 +917,6 @@ local function main()
 	local function installHooks()
 		if Hooks.on or not EX.hook then return false end
 
-		-- start the per-frame silent aim roller
 		if not Hooks.silentConn then
 			Hooks.silentConn = RunService.RenderStepped:Connect(silentTick)
 		end
@@ -1104,30 +960,22 @@ local function main()
 		Hooks.on = false
 	end
 
-	local function bodyOf(p)
-		local ch = p.Character
-		if not ch then return end
-		local hum = ch:FindFirstChildOfClass("Humanoid")
-		if not hum or hum.Health <= 0 then return end
-		return ch, hum, ch:FindFirstChild("Head") or ch:FindFirstChild("HumanoidRootPart")
-	end
-
 	----------------------------------------------------------------------
-	-- Target acquisition (transplanted pipeline)
+	-- Target acquisition
 	----------------------------------------------------------------------
-	local UIS     = UserInputService   -- alias for incoming helpers
-	local camera  = CAM               -- alias for incoming helpers
+	local UIS     = UserInputService
+	local camera  = CAM
 
 	local rayParams = RaycastParams.new()
 	rayParams.FilterType  = Enum.RaycastFilterType.Exclude
 	rayParams.IgnoreWater = true
 
-	local menuFrameRef = nil   -- set after UI builds (see below)
+	local menuFrameRef2 = nil
 
 	local function mouseOverMenu()
-		if not (menuFrameRef and menuFrameRef.Visible) then return false end
+		if not (menuFrameRef2 and menuFrameRef2.Visible) then return false end
 		local m = UIS:GetMouseLocation()
-		local p, sz = menuFrameRef.AbsolutePosition, menuFrameRef.AbsoluteSize
+		local p, sz = menuFrameRef2.AbsolutePosition, menuFrameRef2.AbsoluteSize
 		return m.X >= p.X and m.X <= p.X + sz.X and m.Y >= p.Y and m.Y <= p.Y + sz.Y
 	end
 
@@ -1151,7 +999,12 @@ local function main()
 		return false
 	end
 
+	-- [BF 2] silent mode utilise le cercle offset, jamais la souris brute
 	local function aimCenter(useMouse)
+		if Aim.silent then
+			local vp = camera.ViewportSize
+			return Vector2.new(vp.X * .5 + Aim.silentOffsetX, vp.Y * .5 + Aim.silentOffsetY)
+		end
 		if useMouse and UIS.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
 			return UIS:GetMouseLocation()
 		end
@@ -1169,7 +1022,6 @@ local function main()
 		return part or char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head")
 	end
 
-	-- s: table with .FOV, .TeamCheck, .MaxDistance, .Prediction, .PredictionFactor, .WallCheck
 	local function getClosestTarget(s, partName, useMouse)
 		local center = aimCenter(useMouse)
 		local camPos = camera.CFrame.Position
@@ -1206,7 +1058,6 @@ local function main()
 		return bestScreen, bestWorld, bestPart, bestPlr
 	end
 
-	-- Bridge: acquire() → (player, Vector3)  — shape Kayser's combat loop expects
 	local function acquire()
 		local aimCfg = {
 			FOV         = Aim.silent and Aim.silentFov or Aim.fov,
@@ -1215,7 +1066,7 @@ local function main()
 			Prediction  = false,
 			WallCheck   = Aim.wallCheck,
 		}
-		local _, world, _, plr = getClosestTarget(aimCfg, "Head", Aim.silent)
+		local _, world, _, plr = getClosestTarget(aimCfg, "Head", false)
 		return plr, world
 	end
 
@@ -1240,36 +1091,42 @@ local function main()
 		end)
 	end
 
+	-- [BF 4] silent circle sans Aim.on
+	-- [BF 5] FOV circle utilise les couleurs custom
 	local function updateCircle()
 		local vp = CAM.ViewportSize
-		local center = Vector2.new(vp.X * .5, vp.Y * .5)
-		local activeCenter = center + Vector2.new(Aim.silentOffsetX, Aim.silentOffsetY)
+		local activeCenter = Vector2.new(vp.X * .5 + Aim.silentOffsetX, vp.Y * .5 + Aim.silentOffsetY)
 		local fc = Config.FOVCircle
 
-		-- aimbot FOV circle (Frame + UIStroke)
 		if fovCircleFrame then
 			local showNormal = Aim.on and Aim.showFov and not Aim.silent and fc.Show
 			fovCircleFrame.Visible = showNormal
 			if showNormal then
 				local r = Aim.fov
-				fovCircleFrame.Position = UDim2.fromOffset(activeCenter.X, activeCenter.Y)
+				local center = Vector2.new(vp.X * .5, vp.Y * .5)
+				fovCircleFrame.Position = UDim2.fromOffset(center.X, center.Y)
 				fovCircleFrame.Size     = UDim2.fromOffset(r * 2, r * 2)
-				fovCircleFrame:FindFirstChildOfClass("UIStroke").Color     = Aim.target and C.on or fc.Color
-				fovCircleFrame:FindFirstChildOfClass("UIStroke").Thickness = fc.Thickness
+				local strokeObj = fovCircleFrame:FindFirstChildOfClass("UIStroke")
+				if strokeObj then
+					strokeObj.Color     = Aim.target and C.on or Color3.fromRGB(Aim.fovColorR, Aim.fovColorG, Aim.fovColorB)
+					strokeObj.Thickness = fc.Thickness
+				end
 			end
 		end
 
-		-- silent FOV circle (Frame + UIStroke)
 		if silentCircleFrame then
-			local showSilent = Aim.on and Aim.showFov and Aim.silent and fc.Show
+			local showSilent = Aim.showFov and Aim.silent and fc.Show
 			silentCircleFrame.Visible = showSilent
 			if showSilent then
 				local r = Aim.silentFov
 				silentCircleFrame.Position = UDim2.fromOffset(activeCenter.X, activeCenter.Y)
 				silentCircleFrame.Size     = UDim2.fromOffset(r * 2, r * 2)
-				silentCircleFrame:FindFirstChildOfClass("UIStroke").Color     = Aim.target and C.on
-					or Color3.fromRGB(Aim.silentColorR, Aim.silentColorG, Aim.silentColorB)
-				silentCircleFrame:FindFirstChildOfClass("UIStroke").Thickness = fc.Thickness
+				local strokeObj = silentCircleFrame:FindFirstChildOfClass("UIStroke")
+				if strokeObj then
+					strokeObj.Color     = Aim.target and C.on
+						or Color3.fromRGB(Aim.silentColorR, Aim.silentColorG, Aim.silentColorB)
+					strokeObj.Thickness = fc.Thickness
+				end
 			end
 		end
 	end
@@ -1296,8 +1153,8 @@ local function main()
 			if not BasePart or not BasePart.Parent or not RootPart then return end
 			RootPart.CFrame = CFrame.new(BasePart.Position) * Pos * Ang
 			Character:SetPrimaryPartCFrame(CFrame.new(BasePart.Position) * Pos * Ang)
-			RootPart.Velocity = Vector3.new(9e7, 9e8, 9e7)
-			RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+			RootPart.AssemblyLinearVelocity = Vector3.new(9e7, 9e8, 9e7)
+			RootPart.AssemblyAngularVelocity = Vector3.new(9e8, 9e8, 9e8)
 		end
 
 		local function SFBasePart(BasePart)
@@ -1311,7 +1168,9 @@ local function main()
 				else
 					break
 				end
-			until BasePart.Velocity.Magnitude > 500 or BasePart.Parent ~= TargetPlayer.Character or tick() > Time + 1.5
+			until BasePart.AssemblyLinearVelocity.Magnitude > 500
+				or BasePart.Parent ~= TargetPlayer.Character
+				or tick() > Time + 1.5
 		end
 
 		local fpdh = workspace.FallenPartsDestroyHeight
@@ -1344,12 +1203,13 @@ local function main()
 				local ok, t, h = pcall(acquire)
 				if ok then Aim.target, Aim.headPos = t, h end
 			end
-			updateCircle()
 			if Aim.target and Aim.headPos and not Aim.silent then
 				local goal = CFrame.lookAt(CAM.CFrame.Position, Aim.headPos)
 				CAM.CFrame = Aim.smooth <= 0 and goal or CAM.CFrame:Lerp(goal, math.clamp(1 - Aim.smooth, .04, 1))
 			end
 		end
+
+		updateCircle()
 
 		Rapid.aimFire = Aim.on and Aim.autoFire and Aim.target ~= nil
 		if Rapid.on or Rapid.aimFire then
@@ -1372,18 +1232,30 @@ local function main()
 		end
 	end
 
+	-- [BF 1] combatTick tourne pour toutes les features actives
 	local function ensureCombat()
-		if Aim.on or Rapid.on or SkidFlingAll.on or Config.WalkFling.Enabled or Config.CarFling.Enabled or State.spectating then
+		local wantCombat = Aim.on or Aim.silent or Aim.wallbang or Aim.hitbox
+			or Rapid.on or SkidFlingAll.on or Config.WalkFling.Enabled
+			or Config.CarFling.Enabled or State.spectating
+
+		if wantCombat then
 			if not State.conns.combat then
 				State.conns.combat = hook(RunService.RenderStepped, combatTick)
 			end
-		elseif State.conns.combat and not (Aim.on or Rapid.on or SkidFlingAll.on or Config.WalkFling.Enabled or Config.CarFling.Enabled or State.spectating) then
-			State.conns.combat:Disconnect()
-			State.conns.combat = nil
+		else
+			if State.conns.combat then
+				State.conns.combat:Disconnect()
+				State.conns.combat = nil
+			end
 			Aim.target, Aim.headPos = nil, nil
 			updateCircle()
 		end
-		if Aim.on or Aim.wallbang then installHooks() else removeHooks() end
+
+		if Aim.on or Aim.silent or Aim.wallbang then
+			installHooks()
+		else
+			removeHooks()
+		end
 	end
 
 	task.spawn(function()
@@ -1430,13 +1302,14 @@ local function main()
 			if on then makeHitbox(p) else dropHitbox(p) end
 		end
 		if on and not State.conns.hitRefresh then
-			State.conns.hitRefresh = hook(RunService.Heartbeat, function(dt)
+			State.conns.hitRefresh = hook(RunService.Heartbeat, function()
 				for _, p in ipairs(Players:GetPlayers()) do makeHitbox(p) end
 			end)
 		elseif not on and State.conns.hitRefresh then
 			State.conns.hitRefresh:Disconnect()
 			State.conns.hitRefresh = nil
 		end
+		ensureCombat()
 		notify("hitbox " .. (on and "on" or "off"))
 	end
 
@@ -1475,7 +1348,7 @@ local function main()
 			if on then build(p) else clear(p) end
 		end
 		if on and not State.conns.espRefresh then
-			State.conns.espRefresh = hook(RunService.Heartbeat, function(dt)
+			State.conns.espRefresh = hook(RunService.Heartbeat, function()
 				local _, _, root = getChar()
 				for p, set in pairs(ESP) do
 					local ch = p.Character
@@ -1540,7 +1413,7 @@ local function main()
 			}
 			State.conns.fly = hook(RunService.RenderStepped, function()
 				local _, _, root = getChar()
-				if not root or not State.flyParts[1].Parent then return end
+				if not root or not State.flyParts or not State.flyParts[1].Parent then return end
 				local cf = CAM.CFrame
 				local mv = Vector3.zero
 				if UserInputService:IsKeyDown(Enum.KeyCode.W) then mv += cf.LookVector end
@@ -1735,7 +1608,7 @@ local function main()
 	end
 
 	--==========================================================
-	-- 7. flood engine v2 (probe + harvest + concurrent)
+	-- 7. flood engine v2
 	--==========================================================
 	local Flood = {
 		running = false, busy = false, created = 0, fires = 0, inflight = 0,
@@ -1954,15 +1827,28 @@ local function main()
 		"table_full", "double", "int_pos", "pos_int_cf", "lookvector",
 	}
 
+	-- [BF 6] probe snapshot-diff 0.5s
+	local function snapshotParts()
+		local set = {}
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("BasePart") then set[d] = true end
+		end
+		return set
+	end
+
+	local function diffParts(before)
+		local n = 0
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("BasePart") and not before[d] and not isOurs(d) then n += 1 end
+		end
+		return n
+	end
+
 	local function tryShape(cand, shape)
-		local hits = 0
-		local conn = workspace.DescendantAdded:Connect(function(d)
-			if d:IsA("BasePart") and not isOurs(d) then hits += 1 end
-		end)
+		local before = snapshotParts()
 		pcall(fire, cand, targetCF(Flood.target), shape)
-		task.wait(.2)
-		pcall(function() conn:Disconnect() end)
-		return hits
+		task.wait(.5)
+		return diffParts(before)
 	end
 
 	function Flood.probe(cand)
@@ -1991,7 +1877,8 @@ local function main()
 			if Flood.created >= budget then Flood.stop("budget") end
 		end)
 		local shape = Flood.variant or "cframe"
-		local perWorker = math.max(1, math.floor(Flood.rate / Flood.workers))
+		-- [BF 7] rate math
+		local perWorker = math.max(1, math.floor(Flood.rate / (Flood.workers * math.max(Flood.lag, 0.01))))
 		for w = 1, Flood.workers do
 			task.spawn(function()
 				while Flood.running do
@@ -2020,6 +1907,13 @@ local function main()
 				end
 			end)
 		end
+		-- [BF 8] détecte rejet serveur
+		task.delay(2, function()
+			if Flood.running and Flood.fires > 200 and Flood.created < 20 then
+				notify("remote rejected flood — dead end", 4)
+				Flood.stop("rejected")
+			end
+		end)
 		notify(("flooding %s · %s · %d/s x %d · cap %d"):format(
 			name ~= "" and name or "server", shape, Flood.rate, Flood.workers, budget), 4)
 	end
@@ -2048,8 +1942,14 @@ local function main()
 		Aim.on = v
 		ensureCombat()
 	end)
+	-- [BF 3] silent toggle force Aim.on
 	toggle(cAim, "Silent aim", false, function(v)
 		Aim.silent = v
+		if v and not Aim.on then
+			Aim.on = true
+			local w = Widgets.toggles["Aimbot (camera)"]
+			if w then w.set(true) end
+		end
 		if v and not EX.hook then notify("silent aim needs hookmetamethod") end
 		ensureCombat()
 	end, "hooks Mouse properties / Raycast namecalls")
@@ -2097,13 +1997,25 @@ local function main()
 		ensureCombat()
 		notify("skidfling all " .. (v and "on" or "off"))
 	end, "loops through all targets")
-	toggle(cFire, "WalkFling (Safe Power)", false, function(v)
+	-- [WF 1-5] WalkFling safe
+	toggle(cFire, "WalkFling (safe)", false, function(v)
 		Config.WalkFling.Enabled = v
+		if not v then
+			flingActive = false
+			flingSeeded = false
+			flingVel = Vector3.zero
+			flingAng = Vector3.zero
+			if flingMassOn then setFlingMass(false) end
+		end
 		ensureCombat()
 		notify("walkfling " .. (v and "on" or "off"))
-	end, "custom pass-by fling loop")
-	slider(cFire, "WalkFling Power", 1e6, 5e8, 9e7, function(v) Config.WalkFling.Power = v end)
-	toggle(cFire, "WalkFling Spin", true, function(v) Config.WalkFling.Spin = v end)
+	end, "trigger seulement si proche · safe return actif")
+	slider(cFire, "WalkFling Power", 1e3, 5e4, 5e4, function(v) Config.WalkFling.Power = v end)
+	toggle(cFire, "WalkFling Spin", false, function(v) Config.WalkFling.Spin = v end)
+	toggle(cFire, "WalkFling HeavyBody", false, function(v) Config.WalkFling.HeavyBody = v end, "détectable")
+	toggle(cFire, "WalkFling SafeReturn", true, function(v) Config.WalkFling.SafeReturn = v end)
+	slider(cFire, "WalkFling SafeReturn dist", 10, 200, 50, function(v) Config.WalkFling.SafeReturnDistance = v end)
+	slider(cFire, "WalkFling TriggerRange", 3, 100, 10, function(v) Config.WalkFling.TriggerRange = v end)
 
 	toggle(cFire, "Car Fling", false, function(v)
 		Config.CarFling.Enabled = v
@@ -2111,7 +2023,7 @@ local function main()
 		notify("car fling " .. (v and "on" or "off"))
 	end, "flings vehicles you drive")
 	slider(cFire, "Car Speed", 50, 1000, 100, function(v) Config.CarFling.Speed = v end)
-	slider(cFire, "Car Fling Power", 1e6, 5e8, 9e7, function(v) Config.CarFling.Power = v end)
+	slider(cFire, "Car Fling Power", 1e3, 5e4, 5e4, function(v) Config.CarFling.Power = v end)
 
 	local cAimState = card(pCombat, 40)
 	header(cAimState, "target")
@@ -2129,8 +2041,8 @@ local function main()
 	local cUnlock = card(pVis)
 	header(cUnlock, "client")
 	toggle(cUnlock, "Unlock FPS (240)", false, function(v)
-		if EX.fps then pcall(EX.fps, v and 240 or 60) end
-		notify(v and "fps cap released" or "fps cap restored")
+		if EX.fps then pcall(EX.fps, v and 240 or 240) end
+		notify(v and "fps cap released" or "fps cap kept at 240")
 	end)
 
 	local cMove = card(pMove)
@@ -2462,10 +2374,14 @@ local function main()
 
 	local cInfo = card(pMain)
 	header(cInfo, "info")
-	label(cInfo, ("executor: %s\nhook: %s · drawing: %s · filesystem: %s"):format(
-		tostring(EX.hint or "unknown"), EX.hook and "yes" or "no",
-		EX.draw and "yes" or "no", IO.ok and "yes" or "no"), 46)
-	label(cInfo, "Silent aim and wallbang only bite in client-authoritative games. Hitboxes are local, so they only help where the client computes the hit.", 46)
+	label(cInfo, ("executor: %s\nhook: %s · namecall: %s · fs-hook: %s · drawing: %s · fs: %s"):format(
+		tostring(EX.hint or "unknown"),
+		Bypass.hooked_index and "yes" or "no",
+		Bypass.hooked_namecall and "yes" or "no",
+		Bypass.hooked_fireserver and "yes" or "no",
+		EX.draw and "yes" or "no",
+		IO.ok and "yes" or "no"), 60)
+	label(cInfo, "Silent aim / wallbang : fonctionnent uniquement en client-authoritative. WalkFling : safe sous le clamp serveur.", 40)
 
 	--==========================================================
 	-- 9. lifecycle
@@ -2522,7 +2438,7 @@ local function main()
 					end)
 					status.Text = ("%d fps · %s ms · combat %s · flood %s · ac+%d%s"):format(
 						fps, ping and tostring(ping) or "-",
-						Aim.on and (Aim.silent and "silent" or "aimbot") or "off",
+						Aim.on and (Aim.silent and "silent" or "aimbot") or (Aim.silent and "silent" or "off"),
 						Flood.running and "run" or "idle",
 						Bypass.detections_blocked,
 						Unlimited.on and " · ∞" or "")
@@ -2539,6 +2455,9 @@ local function main()
 		end
 	end)
 
+	-- [AC 5] setfpscap laissé à 240 (pas de flash frame drop)
+	-- [AC 6] WalkSpeed reset à la valeur capturée
+	-- [BF 11] _G.DevTools cleared unload
 	ENV.__KAYSER_UNLOAD = function()
 		if State.killed then return end
 		State.killed = true
@@ -2573,7 +2492,7 @@ local function main()
 		Flood.running = false
 		if Flood.conn then Flood.conn:Disconnect() end
 		spamFolder:Destroy()
-		if EX.fps then pcall(EX.fps, 60) end
+		if EX.fps then pcall(EX.fps, 240) end
 		CAM.FieldOfView = State.baseFov
 		CAM.CameraSubject = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 		local _, hum = getChar()
@@ -2583,6 +2502,11 @@ local function main()
 				hum.UseJumpPower = true
 				hum.JumpPower = State.baseJump
 			end
+		end
+		if _G.DevTools then
+			_G.DevTools.GetAimPosition = nil
+			_G.DevTools.GetAimTarget   = nil
+			_G.DevTools.GetAimDirection = nil
 		end
 		Gui:Destroy()
 		ENV.__KAYSER_LOADED = nil
@@ -2595,7 +2519,6 @@ local function main()
 	--==========================================================
 	-- 10. boot
 	--==========================================================
-	-- FOV circles: Frame + UIStroke (no Drawing dependency)
 	do
 		local fovGui = Instance.new("ScreenGui")
 		fovGui.Name              = "KayserFOV"
@@ -2626,7 +2549,6 @@ local function main()
 		fovCircleFrame    = makeCircleFrame(fovGui)
 		silentCircleFrame = makeCircleFrame(fovGui)
 
-		-- AimTracer
 		local tracerHolder = Instance.new("Frame")
 		tracerHolder.Name                 = "AimTracerHolder"
 		tracerHolder.BackgroundTransparency = 1
@@ -2663,7 +2585,6 @@ local function main()
 		dotStroke.Thickness       = 1
 		dotStroke.Parent          = aimDot
 
-		-- AimTracer render loop
 		RunService.RenderStepped:Connect(function()
 			local cfg = Config.AimTracer
 			if not cfg.Enabled then
@@ -2671,7 +2592,6 @@ local function main()
 				aimDot.Visible = false
 				return
 			end
-			-- use Kayser's acquire() result
 			local ok, t, h = pcall(acquire)
 			if not (ok and h) then
 				aimTracerLine.Visible = false
@@ -2759,11 +2679,14 @@ local function main()
 	Features.renderWaypoints()
 	Flood.render()
 	applyMovement()
-	log("executor:", tostring(EX.hint or "unknown"), "| hook:", EX.hook and "yes" or "no",
-		"| drawing:", EX.draw and "yes" or "no", "| io:", IO.ok and "yes" or "no")
-	notify("KAYSER 2.3 loaded · RightShift UI · END unload", 4)
-	if not EX.hook then notify("silent aim needs hookmetamethod — non supporté", 6) end
-	if not EX.hookfn then notify("harvest unavailable — hookfunction missing", 6) end
+	log("executor:", tostring(EX.hint or "unknown"),
+		"| index:", Bypass.hooked_index and "y" or "n",
+		"| namecall:", Bypass.hooked_namecall and "y" or "n",
+		"| fs:", Bypass.hooked_fireserver and "y" or "n",
+		"| io:", IO.ok and "y" or "n")
+	notify("KAYSER 2.5 loaded · RightShift UI · END unload", 4)
+	if not EX.hook then notify("silent aim needs hookmetamethod — not supported", 6) end
+	if not EX.hookfn then notify("harvest/AC-hook unavailable — hookfunction missing", 6) end
 
 	print("[K] boot complete · gui:", Gui.Parent and Gui.Parent:GetFullName() or "NIL",
 		"· enabled:", tostring(Gui.Enabled), "· size:", tostring(win.AbsoluteSize))
